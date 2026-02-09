@@ -5,8 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Always update CLAUDE.md before making changes.**
 
 
-**CURRENT STATUS**: PHASE 1 implementation revised (2026-02-09). Pending user verification.
-**NEXT PHASE**: PHASE 2 (awaiting PHASE 1 verification/validation)
+**CURRENT STATUS**: PHASE 2 first draft implemented (2026-02-09). Single-point joint streaming for ROB1.
+**PHASE 1 STATUS**: Pending full validation (implementation complete, awaiting user verification)
+**NEXT STEP**: PHASE 2 verification, then circular buffer iteration
 
 ## Project Overview
 
@@ -30,14 +31,15 @@ This is a Handshake Platform between Python and ABB RobotStudio involving **THRE
 
 ## Phased Development Strategy
 
-### PHASE 1 (PENDING_VERIFICATION): Interrupt-driven feedback for the ROBOT
+### PHASE 1 (PENDING_UNTIL_FULL_VALIDATION): Interrupt-driven feedback for the ROBOT
 - **Goal**: Implement the digital input interrupt inside the nested loop of RAPID script.
 - **Action**: Given the RAPID script, you are to modify it accordingly with all the context you have.
-- **Status**: ⏳ Implementation revised on 2026-02-09 - Awaiting user verification
-### PHASE 2 (Future_PHASE): Enable Streaming feature.(pyton)
+- **Status**: ⏳ Implementation revised on 2026-02-09 - Awaiting user verification in RobotStudio
+### PHASE 2 (ACTIVE_PHASE): Enable Streaming feature (Python + RAPID)
 - **Goal**: Use the "The Leaky Bucket" architecture for data streaming between python script and ABB RAPID code.
 - **Action**: Create a sample python code for handshaking such that, PHASE 3 can use this to accomplish the handshake.
-- **Restriction**: My current ABB RobotStudio can't use egm(external-guided-motion, that allows for ~4ms streaming data transfer). The socket 
+- **Status**: ⏳ First draft implemented (2026-02-09) - Single-point joint streaming for ROB1 only. Circular buffer iteration pending.
+- **Restriction**: My current ABB RobotStudio can't use egm(external-guided-motion, that allows for ~4ms streaming data transfer). The socket
 ### PHASE 3 (Future_PHASE): Enable ROS2 (windows11 but using the docker via wsl2) to replace python. 
 - **Goal**: Finalize the handshake platform work between ROS2 and RobotStudio.
 - **Action**: Apply the sample from PHASE 2, "The Leaky Bucket" algorithm using circular buffer into the existing algorithm, and expands it into ROS2 node. 
@@ -94,7 +96,7 @@ This is a Handshake Platform between Python and ABB RobotStudio involving **THRE
 ## Phase-Specific Restrictions
 ***Please make sure not to move ahead, unless the current stage is fully completed.***
 
-**PHASE 1 (ACTIVE_PHASE)**
+**PHASE 1 (PENDING_UNTIL_FULL_VALIDATION)**
 - Using the TRAP function from RAPID, I want to build an interrupt DI signal that exits the current motion as soon as the signal is detected. 
 The entire structure remains the same, such that still robot controller and RAPID takes the incoming motion state information, but while execution, it exits the current motion upon the interrupt is trigger.
 While discussion with Gemini, we decided to go with "Global Eject" Strategy. This is the suggestion from Gemini, but the suggested script is not ideal as the socket communication functionality is not decoupled from the motion related scripts (such as MainModule_R1, MainModule_R2). Here is the excerpts of our conversation, primarily focusing on how to modify the RAPID scripts: 
@@ -323,7 +325,75 @@ PHASE 2 preparation requires PHASE 1 interrupt system to be fully tested, verifi
 
 ---
 
-**PHASE 2 (Future)**
+## PHASE 2 - IMPLEMENTATION HISTORY
+
+### Date: 2026-02-09 (First Draft)
+### Status: ⏳ AWAITING USER VERIFICATION
+
+#### Implementation Summary
+First draft of joint streaming: establishes data structures, protocol (`"j"` header), mode toggling, and single-point `MoveAbsJ` execution for ROB1 only. The full circular buffer ("Leaky Bucket") will be layered on top in a subsequent iteration.
+
+#### Protocol Format
+
+| Header | Format | Description |
+|--------|--------|-------------|
+| `d` | `d;path;tool;speed;state;` | Standard pre-defined state motion (existing) |
+| `j` | `j;j1;j2;j3;j4;j5;j6;` | Joint streaming - 6 axis values in degrees (new) |
+| `I` | `I;...` | Connection handshake (existing) |
+| `T` | `T;...` | Termination (existing) |
+
+#### Files Modified
+
+**1. commModule.mod** (`/ABB RAPID/commModule.mod`)
+- Extended `dataPacket` RECORD with 6 joint streaming fields (`streamJ1`-`streamJ6`)
+- Added PERS variables:
+  - `operationMode` ("d" or "j") - mode toggle shared across tasks
+  - `streamJointTarget_R1` - jointtarget for R1 streaming
+  - `newStreamTarget_R1` - flag to trigger R1 joint motion
+- Updated `ParseMessage` to parse "j" header with 6 semicolon-delimited joint values
+- Updated `updateGlobalVariable` "j" case to populate `streamJointTarget_R1` and set `newStreamTarget_R1`
+- Modified `cmdExe` dispatch: "j" mode sets `executionNotCompleted_R1` only (R2 not involved in first draft)
+
+**2. MainModule_ROB1.mod** (`/ABB RAPID/MainModule_ROB1.mod`)
+- Added PERS declarations: `operationMode`, `streamJointTarget_R1`, `newStreamTarget_R1`
+- Updated `KeepLooping` to check `newStreamTarget_R1` flag (independent of `newTargetFlag_R1`)
+- Added `Run_Joint_Stream_R1` procedure:
+  - Executes `MoveAbsJ streamJointTarget_R1, v1000, z5, tool0`
+  - Protected by same Global Eject ERROR handler as standard motion
+  - Handles `ERR_INTERRUPT` for DI signal compatibility with PHASE 1
+
+**3. MainModule_ROB2.mod** (`/ABB RAPID/MainModule_ROB2.mod`)
+- Added `PERS string operationMode` declaration for cross-task PERS compatibility
+- No motion changes for R2 in this first draft
+
+**4. server_multiMove.py** (`/PythonHMI/server_multiMove.py`)
+- Added `send_joint_stream()` function: sends `j;` prefixed joint values, waits for ACK_DONE
+- Added `run_streaming_test()` function: 20-point sine wave test on J1 (+/- 5 degrees, 2 Hz)
+- Integrated into main loop dispatch:
+  - `data[0] == 5`: single joint stream command (data format: `(5, j1, j2, j3, j4, j5, j6)`)
+  - `data[0] == 6`: run streaming test sequence
+
+#### Architecture Decisions
+- **ROB1 only** for this first draft - R2 streaming will follow after validation
+- **Single-point execution** (not circular buffer yet) - establishes protocol before optimizing throughput
+- **Unified ACK** maintained - commModule sends ACK_DONE after joint motion completes, same as standard mode
+- **PHASE 1 compatibility** - interrupt TRAP handlers work during joint streaming motion
+- **Decoupled architecture preserved** - commModule handles parsing/routing, MainModule_ROB1 handles motion
+
+#### Testing Checklist
+- [ ] Load modified modules into robot controller
+- [ ] **Test 1 - Standard Regression**: Send "d" packet, verify existing motion still works
+- [ ] **Test 2 - Joint Stream**: Send "j" packet with known joint values, verify R1 moves to position
+- [ ] **Test 3 - Mode Switch**: Send "d" then "j" then "d", verify mode toggles correctly
+- [ ] **Test 4 - Interrupt During Stream**: Trigger DI during joint stream motion, verify PHASE 1 interrupt works
+- [ ] **Test 5 - Python Integration**: Run `run_streaming_test()`, verify 20-point oscillation executes
+
+#### Next Iteration
+After validation, implement the circular buffer ("Leaky Bucket") for continuous streaming without per-point ACK wait.
+
+---
+
+**PHASE 2 (Reference - Gemini Conversation)**
 - I want to have a different mode for each robot for individual switch from pre-define state motion to streaming mode. During the streaming mode, it only takes the 6 joint motions as input. Here is the conversation from the Gemini. 
 
     Since you do not have the EGM (Externally Guided Motion) option, you are entering the realm of "standard socket streaming." This is challenging because the RAPID interpreter is not designed for real-time 30 Hz updates like a joystick. If the robot finishes a move before the next one arrives and is processed, it must stop (stutter). If you buffer too many points, the robot moves smoothly but the camera feedback is old (latency).

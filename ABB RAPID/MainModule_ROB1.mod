@@ -18,6 +18,11 @@ MODULE MainModule_ROB1
     ! Shared flag to indicate interrupt occurred
     PERS bool wasInterrupted_R1 := FALSE;
 
+    ! PHASE 2: Streaming variables (shared with commModule)
+    PERS string operationMode := "d";
+    PERS jointtarget streamJointTarget_R1 := [[0,0,0,0,0,0],[9E9,9E9,9E9,9E9,9E9,9E9]];
+    PERS bool newStreamTarget_R1 := FALSE;
+
     PROC main()
         TPErase;
         TPWrite "R1: Main module started.";
@@ -82,6 +87,16 @@ MODULE MainModule_ROB1
                     TPWrite "R1, execution completed, waiting for next command.";
                 ENDIF
             ENDIF
+
+            ! PHASE 2: Joint streaming check (independent of newTargetFlag)
+            IF newStreamTarget_R1 = TRUE THEN
+                newStreamTarget_R1 := FALSE;
+                Run_Joint_Stream_R1;
+                IF NOT wasInterrupted_R1 THEN
+                    executionNotCompleted_R1 := FALSE;
+                ENDIF
+            ENDIF
+
             WaitTime 0.25; ! wait for a short time before checking the flag again
         ENDWHILE
     ENDPROC
@@ -201,6 +216,36 @@ MODULE MainModule_ROB1
 
         RETURN tempTarget;
     ENDFUNC
+
+    ! ====================================================
+    ! PHASE 2: JOINT STREAMING MOTION PROCEDURE
+    ! ====================================================
+    ! Executes a single joint target received from streaming.
+    ! Uses MoveAbsJ with zone data for blending.
+    ! Protected by the same Global Eject interrupt pattern.
+    ! ====================================================
+    PROC Run_Joint_Stream_R1()
+        wasInterrupted_R1 := FALSE;
+
+        TPWrite "R1: Executing joint stream target";
+
+        ! Use MoveAbsJ with zone data for blending (z5 for smooth streaming)
+        MoveAbsJ streamJointTarget_R1, v1000, z5, tool0;
+
+        TPWrite "R1: Joint stream motion completed.";
+
+    ERROR
+        IF ERRNO = ERR_INTERRUPT THEN
+            TPWrite "R1: *** JOINT STREAM INTERRUPTED BY DI SIGNAL ***";
+            wasInterrupted_R1 := TRUE;
+            executionNotCompleted_R1 := FALSE;
+            RETURN;
+        ELSE
+            TPWrite "R1: Unexpected error in joint stream: "\Num:=ERRNO;
+            executionNotCompleted_R1 := FALSE;
+            RETURN;
+        ENDIF
+    ENDPROC
 
     ! ====================================================
     ! TRAP HANDLER - INTERRUPT SERVICE ROUTINE

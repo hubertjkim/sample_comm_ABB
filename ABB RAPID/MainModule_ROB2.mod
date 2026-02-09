@@ -18,6 +18,9 @@ MODULE MainModule_ROB2
     ! Shared flag to indicate interrupt occurred
     PERS bool wasInterrupted_R2 := FALSE;
 
+    ! PHASE 2: Streaming variables (declared for cross-task PERS compatibility)
+    PERS string operationMode := "d";
+
     PROC main()
         TPErase;
         TPWrite "R2: Main module started.";

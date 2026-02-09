@@ -2,6 +2,7 @@ import zmq
 import struct
 import time
 import sys
+import math
 from src.communication.socket_manager import ExtSocketServer
 from src import state_machines
 from config.constants import pathDict, stateSequence_MultiMove
@@ -62,6 +63,64 @@ def send_command_to_external_socket(userPathSelection: int, userSequenceSelectio
                 done_Multimove = True   
             
     return data_list
+
+def send_joint_stream(joint_values: list[float], socket_ext: ExtSocketServer) -> bool:
+    """Send a single joint streaming packet to the robot controller.
+
+    Args:
+        joint_values: List of 6 float values [j1, j2, j3, j4, j5, j6] in degrees
+        socket_ext: The external socket connection to the robot controller
+
+    Returns:
+        True if motion completed successfully
+    """
+    socket_ext.send_data(joint_values, 'j;')
+    print(f'Joint stream sent: {joint_values}')
+
+    # Wait for acknowledgment
+    done = False
+    while not done:
+        response = socket_ext.receive_data()
+        if response is not None and len(response) == 6:
+            if response[0] == 9:
+                print("Joint stream motion completed.")
+                done = True
+    return True
+
+def run_streaming_test(socket_ext: ExtSocketServer):
+    """Test joint streaming with a simple sine wave motion pattern.
+
+    Sends 20 joint target points with a small oscillation on J1.
+    Safe for testing - only moves +/- 5 degrees on joint 1.
+    """
+    print("Starting joint streaming test...")
+    t = 0
+    frequency = 2.0  # 2 Hz for safety during testing
+    period = 1.0 / frequency
+
+    # Base joint position (safe starting position - adjust for your robot)
+    base_joints = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    try:
+        for i in range(20):  # 20 points for testing
+            start_time = time.time()
+
+            # Small oscillation on joint 1 only (safe test)
+            joints = base_joints.copy()
+            joints[0] = base_joints[0] + 5.0 * math.sin(t)  # +/- 5 degrees on J1
+
+            send_joint_stream(joints, socket_ext)
+            t += 0.3
+
+            elapsed = time.time() - start_time
+            sleep_time = period - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    except KeyboardInterrupt:
+        print("Streaming test stopped by user.")
+
+    print("Joint streaming test completed.")
 
 def main()->None:
     global internal_socket_only, previous_sequence, wasPreviousExecutionSuccessful, fmt_elen, PACKET_OFFSET, MAX_PACKET_SIZE
@@ -148,7 +207,19 @@ def main()->None:
                             else:
                                 # forever loop begins here:
                                 if not internal_socket_only:
-                                    if not previous_sequence == data[1]: # if we're running two consecutive identical sequnces, then skip it
+                                    if int(data[0]) == 5:
+                                        # PHASE 2: Joint streaming mode
+                                        # data format: (5, j1, j2, j3, j4, j5, j6)
+                                        joint_values = [float(data[i]) for i in range(1, min(len(data), 7))]
+                                        if len(joint_values) == 6:
+                                            send_joint_stream(joint_values, socket_ext_Multimove)
+                                        else:
+                                            print(f"Invalid joint stream data length: {len(joint_values)}, expected 6")
+                                    elif int(data[0]) == 6:
+                                        # PHASE 2: Run streaming test
+                                        run_streaming_test(socket_ext_Multimove)
+                                    elif not previous_sequence == data[1]:
+                                        # Standard state motion dispatch
                                         send_command_to_external_socket(int(data[0]), int(data[1]), tempClientState, socket_ext_Multimove)
                                         previous_sequence = data[1]
                                         wasPreviousExecutionSuccessful = True

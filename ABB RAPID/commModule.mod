@@ -18,7 +18,14 @@ MODULE commModule
         num selectedTool;
         num selectedSpeed;
         num selectedState;
-    ENDRECORD 
+        ! PHASE 2: Joint streaming fields
+        num streamJ1;
+        num streamJ2;
+        num streamJ3;
+        num streamJ4;
+        num streamJ5;
+        num streamJ6;
+    ENDRECORD
 
     CONST num R1_PortNo := 5024;
     CONST string R1_IPAddress := "127.0.0.1";
@@ -48,6 +55,16 @@ MODULE commModule
     PERS num speedChoice;
     PERS num stateChoice;
     PERS num stateChoice_prev;
+
+    ! PHASE 2: Operation mode toggle
+    ! "d" = standard (pre-defined state motion), "j" = joint streaming
+    PERS string operationMode := "d";
+
+    ! PHASE 2: Shared joint streaming target for R1
+    PERS jointtarget streamJointTarget_R1 := [[0,0,0,0,0,0],[9E9,9E9,9E9,9E9,9E9,9E9]];
+
+    ! PHASE 2: Streaming execution flag
+    PERS bool newStreamTarget_R1 := FALSE;
 
     PROC commMain()
         TPErase;
@@ -116,16 +133,23 @@ MODULE commModule
                 receivedDataPkg := ParseMessage (mydata)
                 updateGlobalVariable(receivedDataPkg)
 
-                IF NOT stateChoice_prev = stateChoice THEN
-                    ! Make the motion task execute the new target
-                    newTargetFlag_R1 := TRUE;
-                    newTargetFlag_R2 := TRUE; ! trigger the motion task to execute the new target
-                    executionNotCompleted_R1 := TRUE; ! set the execution flag to true
-                    executionNotCompleted_R2 := TRUE; ! set the execution flag to true
-                ELSE
-                    TPWrite "Same state choice as before, not executing motion";
-                    initialRun := TRUE; ! reset the initial run flag to avoid skipping the next execution
-                    SocketSend client_socket\str:='ACK_DONE'; ! send unified acknowledgment (no motion executed)
+                IF smIndx = "j" THEN
+                    ! PHASE 2: Joint streaming mode - trigger R1 only
+                    executionNotCompleted_R1 := TRUE;
+                    ! R2 not involved in streaming (first draft)
+                    executionNotCompleted_R2 := FALSE;
+                ELSEIF smIndx = "d" THEN
+                    IF NOT stateChoice_prev = stateChoice THEN
+                        ! Make the motion task execute the new target
+                        newTargetFlag_R1 := TRUE;
+                        newTargetFlag_R2 := TRUE;
+                        executionNotCompleted_R1 := TRUE;
+                        executionNotCompleted_R2 := TRUE;
+                    ELSE
+                        TPWrite "Same state choice as before, not executing motion";
+                        initialRun := TRUE;
+                        SocketSend client_socket\str:='ACK_DONE';
+                    ENDIF
                 ENDIF
 
                 TPWrite "Waiting for next client data...";
@@ -151,8 +175,18 @@ MODULE commModule
         smIndx := receivedDataPkg.commHeader;
         
         TEST smIndx
-        CASE "j": ! update absolute position of the robot
-            !placeholder for streamingg the absolute position data
+        CASE "j":
+            ! PHASE 2: Joint streaming mode
+            operationMode := "j";
+            streamJointTarget_R1.robax.rax_1 := receivedDataPkg.streamJ1;
+            streamJointTarget_R1.robax.rax_2 := receivedDataPkg.streamJ2;
+            streamJointTarget_R1.robax.rax_3 := receivedDataPkg.streamJ3;
+            streamJointTarget_R1.robax.rax_4 := receivedDataPkg.streamJ4;
+            streamJointTarget_R1.robax.rax_5 := receivedDataPkg.streamJ5;
+            streamJointTarget_R1.robax.rax_6 := receivedDataPkg.streamJ6;
+            streamJointTarget_R1.extax := [9E9,9E9,9E9,9E9,9E9,9E9];
+            newStreamTarget_R1 := TRUE;
+            TPWrite "Joint streaming target received for R1";
         CASE "d": ! update the data structure with the incoming data
             pathChoice := receivedDataPkg.selectedPath;
             toolChoice := receivedDataPkg.selectedTool;
@@ -185,14 +219,29 @@ MODULE commModule
 
         IF packet_receive.commHeader = "d" THEN
             ! if the header is "d", extract the data values
-            data_1 := StrFind(message, pkgHeader + 1, ";"); ! find the position of the second comma to extract data 1
-            data_2 := StrFind(message, data_1 + 1, ";"); ! find the position of the third comma to extract data 2
-            data_3 := StrFind(message, data_2 + 1, ";"); ! find the position of the fourth comma to extract data 3
-            data_4 := StrFind(message, data_3 + 1, ";"); ! find the position of the fifth comma to extract data 4
+            data_1 := StrFind(message, pkgHeader + 1, ";");
+            data_2 := StrFind(message, data_1 + 1, ";");
+            data_3 := StrFind(message, data_2 + 1, ";");
+            data_4 := StrFind(message, data_3 + 1, ";");
             bResult := StrToVal(StrPart(message, pkgHeader + 1, data_1 - pkgHeader - 1), packet_receive.selectedPath);
             bResult := StrToVal(StrPart(message, data_1 + 1, data_2 - data_1 - 1), packet_receive.selectedTool);
             bResult := StrToVal(StrPart(message, data_2 + 1, data_3 - data_2 - 1), packet_receive.selectedSpeed);
             bResult := StrToVal(StrPart(message, data_3 + 1, data_4 - data_3 - 1), packet_receive.selectedState);
+
+        ELSEIF packet_receive.commHeader = "j" THEN
+            ! PHASE 2: Parse 6 joint values from format: j;j1;j2;j3;j4;j5;j6;
+            data_1 := StrFind(message, pkgHeader + 1, ";");
+            data_2 := StrFind(message, data_1 + 1, ";");
+            data_3 := StrFind(message, data_2 + 1, ";");
+            data_4 := StrFind(message, data_3 + 1, ";");
+            data_5 := StrFind(message, data_4 + 1, ";");
+            data_6 := StrFind(message, data_5 + 1, ";");
+            bResult := StrToVal(StrPart(message, pkgHeader + 1, data_1 - pkgHeader - 1), packet_receive.streamJ1);
+            bResult := StrToVal(StrPart(message, data_1 + 1, data_2 - data_1 - 1), packet_receive.streamJ2);
+            bResult := StrToVal(StrPart(message, data_2 + 1, data_3 - data_2 - 1), packet_receive.streamJ3);
+            bResult := StrToVal(StrPart(message, data_3 + 1, data_4 - data_3 - 1), packet_receive.streamJ4);
+            bResult := StrToVal(StrPart(message, data_4 + 1, data_5 - data_4 - 1), packet_receive.streamJ5);
+            bResult := StrToVal(StrPart(message, data_5 + 1, data_6 - data_5 - 1), packet_receive.streamJ6);
 
         ENDIF
     RETURN packet_receive
