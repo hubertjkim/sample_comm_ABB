@@ -2,21 +2,38 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 **Always check `ACTIVE_PHASE` in CLAUDE.md before making changes.**
+**Always update CLAUDE.md before making changes.**
 
-**CURRENT STATUS**: PHASE 1 implementation completed (2026-02-09). Ready for testing.
-**NEXT PHASE**: PHASE 2 (awaiting PHASE 1 testing/validation)
+
+**CURRENT STATUS**: PHASE 1 implementation revised (2026-02-09). Pending user verification.
+**NEXT PHASE**: PHASE 2 (awaiting PHASE 1 verification/validation)
 
 ## Project Overview
 
-This is a Handshake Platform between python and RobotStudio.
-I have python scripts for handshaking two ABB robots via tcp/ip socket communication. The python user Interface provides a package of data for each via ethernet, and RAPID script inside the robot controller execute pre-programmed motion states according to the package information. Note that these codes are not the actual codes, just to show you the structure of the current working excerpt.
+This is a Handshake Platform between Python and ABB RobotStudio involving **THREE robots** across **TWO robot controllers**:
+
+### System Architecture
+
+**Client Layer:**
+- `clientUI.py`: Main user interface that interacts with operators. Creates a linked list of tasks and sends data to virtual servers via ZMQ.
+
+**Server Layer (Virtual Servers):**
+- `server_multimove.py`: Virtual server communicating with **ONE robot controller** that controls **TWO robots (ROB1 and ROB2)** in synchronized multimove operation. This corresponds to the "/ABB RAPID" folder scripts.
+- `server_cobot.py`: Virtual server communicating with a **separate independent robot controller** for **ROB3** (a cobot). This is not part of the "/ABB RAPID" folder scope.
+
+**Robot Controller Layer:**
+- **Multimove Controller** (ROB1 + ROB2): Contains three RAPID modules running as separate tasks:
+  - `commModule.mod` (T_COMM task): Handles all socket communication with server_multimove.py
+  - `MainModule_ROB1.mod` (T_ROB1 task): Motion control for Robot 1
+  - `MainModule_ROB2.mod` (T_ROB2 task): Motion control for Robot 2
+- **Cobot Controller** (ROB3): Independent controller (not detailed in this project scope)
 
 ## Phased Development Strategy
 
-### PHASE 1 (COMPLETED): Interrupt-driven feedback for the ROBOT
+### PHASE 1 (PENDING_VERIFICATION): Interrupt-driven feedback for the ROBOT
 - **Goal**: Implement the digital input interrupt inside the nested loop of RAPID script.
 - **Action**: Given the RAPID script, you are to modify it accordingly with all the context you have.
-- **Status**: ✅ Implementation completed on 2026-02-09 (see Implementation History below)
+- **Status**: ⏳ Implementation revised on 2026-02-09 - Awaiting user verification
 ### PHASE 2 (Future_PHASE): Enable Streaming feature.(pyton)
 - **Goal**: Use the "The Leaky Bucket" architecture for data streaming between python script and ABB RAPID code.
 - **Action**: Create a sample python code for handshaking such that, PHASE 3 can use this to accomplish the handshake.
@@ -26,19 +43,51 @@ I have python scripts for handshaking two ABB robots via tcp/ip socket communica
 - **Action**: Apply the sample from PHASE 2, "The Leaky Bucket" algorithm using circular buffer into the existing algorithm, and expands it into ROS2 node. 
 - **Restriction**: My environment can't support dual boot. Always docker with wsl2 is the only option. 
 
-## Script Architecture
+## Detailed Script Architecture
 
-- '~/ABB RAPID/' : robot-related files in this directory (ABB RAPID script that ends with .mod). 
-There are three .mod files here that are to be built inside the Robot Controllers and communicate with the python scripts. Each of them are following:
-1. commModule is running inside the ABB RAPID robot under T_comm, a TASK dedicated to communication functionality only. 
-2. MainModule_R1 is running inside the ABB and under the T_ROB1, a TASK dedicated to run the Robot 1. 
-3. MainModule_R2 is running inside the ABB and under the T_ROB2, a TASK dedicated to run the Robot 2.
-As how ABB Structure is structured, TASK does not share the namespace, like function, variables, unless universally declared. Since this ABB controller has multimove licesnse, all of these modules are inside the same brain and can be in sync. 
-Upon robot execution, commModule is constantly listening the package from user/python. Once it receives the package, it parses them, and sends corresponding data to either MainModule_R1 or MainModule_R2. 
+### Python Scripts
 
-- I have two primary python scripts. 
-1. clientUI.py is the main UI interacting with the operator. It takes all the sequence of data, creat a linkedlist from the tasks and send those to virtual servers via zmq.
-2. server_multimove.py is the virtual server that takes the data package from clientUI.py and communicates with ABB RAPID scripts. I made this virtual server for two reasons:1 I can add more robot controllers easily;2 I can swap the ip address for real robot controller or virtual controller in Robot Studio. 
+**1. clientUI.py** - Main User Interface
+- Interacts with the operator
+- Creates a linked list of tasks from operator input
+- Sends task sequences to virtual servers via ZMQ
+- Receives acknowledgments from servers
+
+**2. server_multimove.py** - Virtual Server for Multimove Controller
+- Receives data packages from clientUI.py via ZMQ
+- Communicates with the **Multimove Robot Controller** (ROB1 + ROB2) via TCP/IP socket
+- Benefits: Easy addition of more controllers, easy IP swapping between real/virtual controllers in RobotStudio
+
+**3. server_cobot.py** - Virtual Server for Cobot Controller
+- Receives data packages from clientUI.py via ZMQ
+- Communicates with the **independent Cobot Controller** (ROB3) via TCP/IP socket
+- (Not part of the "/ABB RAPID" folder scope)
+
+### ABB RAPID Scripts (Multimove Controller Only)
+
+**Directory:** `~/ABB RAPID/` contains three .mod files for the Multimove Controller:
+
+**1. commModule.mod** (T_COMM task)
+- Dedicated communication task
+- Constantly listens for packages from server_multimove.py via socket
+- Parses incoming data packages
+- Routes data to MainModule_ROB1 or MainModule_ROB2 as appropriate
+- Sends acknowledgments back to server_multimove.py
+
+**2. MainModule_ROB1.mod** (T_ROB1 task)
+- Dedicated motion control task for Robot 1
+- Receives motion commands from commModule via shared PERS variables
+- Executes motion sequences for ROB1
+
+**3. MainModule_ROB2.mod** (T_ROB2 task)
+- Dedicated motion control task for Robot 2
+- Receives motion commands from commModule via shared PERS variables
+- Executes motion sequences for ROB2
+
+**Key Architectural Points:**
+- TASKs do NOT share namespace (functions, variables) unless universally declared as PERS
+- The Multimove Controller has a **multimove license**, allowing all three modules to run within the same controller and synchronize
+- Communication is **decoupled** from motion: commModule handles all socket I/O, MainModules handle all robot motion 
 
 
 
@@ -134,13 +183,45 @@ While discussion with Gemini, we decided to go with "Global Eject" Strategy. Thi
 
 ---
 
+## PHASE 1 - CRITICAL REQUIREMENTS
+
+### Digital Input Interrupt Behavior
+
+**IMPORTANT: Unified Acknowledgment Protocol**
+
+The system must implement a **unified acknowledgment** approach, NOT separate ACK_DONE and ACK_SKIPPED signals:
+
+1. **When DI interrupt triggers from EITHER ROB1 or ROB2:**
+   - The triggered robot immediately stops its current motion (via TRAP handler)
+   - commModule waits for **BOTH ROB1 AND ROB2** to complete their current motion state
+   - After both robots are idle/completed, commModule sends a **single acknowledgment** back to server_multimove.py → clientUI.py
+   - The acknowledgment should be the same regardless of whether an interrupt occurred
+
+2. **Synchronization Requirement:**
+   - Since ROB1 and ROB2 operate as a coordinated multimove system, they must complete their motion sequences together
+   - Even if only one robot is interrupted, the system waits for both to reach a safe idle state
+   - This ensures coordination integrity and prevents desynchronization between the two robots
+
+3. **Implementation Strategy:**
+   - Use the "Global Eject" strategy from Gemini's suggestion
+   - Both MainModule_ROB1 and MainModule_ROB2 must have TRAP handlers for their respective DI signals
+   - commModule must track completion status of both robots before sending acknowledgment
+   - Maintain decoupled architecture: communication logic stays in commModule, motion logic in MainModules
+
+---
+
 ## PHASE 1 - IMPLEMENTATION HISTORY
 
-### Date: 2026-02-09
-### Status: ✅ COMPLETED
+### Date: 2026-02-09 (Revised)
+### Status: ⏳ AWAITING USER VERIFICATION
 
 #### Implementation Summary
-Successfully implemented the "Global Eject" interrupt strategy across all RAPID modules while maintaining the existing decoupled architecture (communication in commModule, motion in MainModule_R1/R2).
+Successfully implemented the "Global Eject" interrupt strategy across all RAPID modules with decoupled architecture and unified acknowledgment protocol:
+
+**Revisions Completed:**
+1. ✅ Implemented unified acknowledgment (single ACK_DONE message regardless of interrupt status)
+2. ✅ Confirmed synchronization logic waits for BOTH ROB1 and ROB2 to complete before acknowledgment
+3. ✅ Updated system architecture documentation (added ROB3/server_cobot.py context)
 
 #### Files Modified
 
@@ -178,18 +259,18 @@ Successfully implemented the "Global Eject" interrupt strategy across all RAPID 
 - Added PERS declarations for interrupt status:
   - `wasInterrupted_R1` and `wasInterrupted_R2` flags (shared with MainModules)
 
-- Enhanced acknowledgment protocol in `cmdExe()`:
-  - Checks interrupt flags after motion completion
-  - Sends `"ACK_DONE"` for successful completion
-  - Sends `"ACK_SKIPPED"` when motion interrupted by DI signal
-  - Resets interrupt flags after acknowledgment
-
-- Updated all acknowledgment points to use new protocol consistently
+- ✅ **REVISED:** Unified acknowledgment protocol in `cmdExe()`:
+  - ✅ Waits for BOTH ROB1 and ROB2 to complete (via `WHILE executionNotCompleted_R1 OR executionNotCompleted_R2` loop)
+  - ✅ Sends single unified `"ACK_DONE"` message regardless of interrupt status
+  - ✅ Logs interrupt status for diagnostics before sending acknowledgment
+  - ✅ Resets interrupt flags after acknowledgment for next cycle
 
 #### Architecture Integrity
 ✅ **Decoupling Maintained**: Communication logic remains in commModule, motion logic in MainModules
-✅ **No Python Changes Required**: Backward compatible (can distinguish ACK types if desired)
+✅ **Synchronization Implemented**: commModule waits for both ROB1 and ROB2 before acknowledgment
+✅ **Unified Acknowledgment**: Single ACK_DONE message sent regardless of interrupt status
 ✅ **Multimove Compatibility**: Both robots independently handle interrupts, flags tracked separately
+✅ **No Python Changes Required**: Backward compatible - clientUI.py receives ACK_DONE as before
 
 #### Configuration Required Before Use
 ⚠️ **CRITICAL**: Configure DI signal name in both MainModule files:
@@ -198,7 +279,7 @@ CONST string DI_INTERRUPT_SIGNAL := "diInterruptSignal";
 ```
 Replace with actual signal name from I/O System Configuration (e.g., "diEmergencyStop", "diSafetyStop")
 
-#### How It Works
+#### How It Works (Revised Implementation - Awaiting Verification)
 1. **Initialization**: `Setup_Interrupt_Rx()` connects DI signal to TRAP handler at startup
 2. **Normal Operation**: Motion executes via `Run_Motion_Manager_Rx()` with ERROR protection
 3. **Interrupt Triggered**:
@@ -207,19 +288,38 @@ Replace with actual signal name from I/O System Configuration (e.g., "diEmergenc
    - Logic jump: RAISE ERR_INTERRUPT
 4. **Error Bubbling**: ERR_INTERRUPT caught by Run_Motion_Manager_Rx ERROR handler
 5. **Clean Exit**: Sets wasInterrupted flag, resets execution flag, RETURNs to idle
-6. **Acknowledgment**: commModule detects interrupt flag, sends "ACK_SKIPPED" to Python
+6. ✅ **Unified Acknowledgment**:
+   - commModule waits for BOTH `executionNotCompleted_R1` and `executionNotCompleted_R2` to become FALSE
+   - Logs interrupt status for diagnostics (R1 and R2 interrupt flags)
+   - Sends single unified `"ACK_DONE"` acknowledgment to clientUI.py
+   - Resets interrupt flags for next cycle
 
 #### Testing Checklist
-- [ ] Configure DI signal name in both MainModule files
+- [ ] Configure DI signal name in both MainModule files (default: "diInterruptSignal")
 - [ ] Load modified modules into robot controller (T_ROB1, T_ROB2, T_COMM tasks)
-- [ ] Test normal operation (should work as before)
-- [ ] Trigger DI signal during motion execution
-- [ ] Verify FlexPendant messages show TRAP trigger and interrupt handling
-- [ ] Verify Python receives "ACK_SKIPPED" message
-- [ ] Verify robot accepts next command immediately after interrupt
+- [ ] **Test 1 - Normal Operation**: Execute motion without interrupt
+  - [ ] Verify both robots complete motion successfully
+  - [ ] Verify clientUI.py receives "ACK_DONE"
+  - [ ] Check FlexPendant logs show "Motion completed successfully"
+- [ ] **Test 2 - ROB1 Interrupt**: Trigger DI signal on ROB1 during motion
+  - [ ] Verify ROB1 stops immediately and executes TRAP handler
+  - [ ] Verify commModule waits for BOTH ROB1 and ROB2 to complete
+  - [ ] Verify clientUI.py receives unified "ACK_DONE" (not separate signal)
+  - [ ] Check FlexPendant logs show interrupt status for diagnostics
+  - [ ] Verify robot accepts next command immediately
+- [ ] **Test 3 - ROB2 Interrupt**: Trigger DI signal on ROB2 during motion
+  - [ ] Verify ROB2 stops immediately and executes TRAP handler
+  - [ ] Verify commModule waits for BOTH ROB1 and ROB2 to complete
+  - [ ] Verify clientUI.py receives unified "ACK_DONE"
+  - [ ] Check FlexPendant logs show interrupt status for diagnostics
+  - [ ] Verify robot accepts next command immediately
+- [ ] **Test 4 - Dual Interrupt**: Trigger DI signals on both robots simultaneously
+  - [ ] Verify both robots stop and handle interrupts
+  - [ ] Verify unified acknowledgment sent only once
+  - [ ] Verify system recovers and accepts next command
 
 #### Next Phase
-PHASE 2 preparation requires PHASE 1 interrupt system to be fully tested and operational in production environment.
+PHASE 2 preparation requires PHASE 1 interrupt system to be fully tested, verified, and operational in production environment.
 
 ---
 

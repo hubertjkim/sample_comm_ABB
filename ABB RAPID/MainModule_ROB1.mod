@@ -125,7 +125,8 @@ MODULE MainModule_ROB1
             ! Set the interrupt flag for commModule to detect
             wasInterrupted_R1 := TRUE;
 
-            ! Reset execution flag so commModule can send ACK_SKIPPED
+            ! Reset execution flag so commModule knows this robot is done
+            ! commModule waits for BOTH R1 and R2 before sending unified ACK
             executionNotCompleted_R1 := FALSE;
 
             ! Return to KeepLooping to wait for next command

@@ -5,8 +5,8 @@ MODULE commModule
     ! ====================================================
     ! PHASE 1: Enhanced with interrupt-driven feedback
     ! - Monitors wasInterrupted flags from MainModules
-    ! - Sends "ACK_DONE" for successful completion
-    ! - Sends "ACK_SKIPPED" when motion is interrupted
+    ! - Waits for BOTH ROB1 and ROB2 to complete before acknowledgment
+    ! - Sends unified acknowledgment regardless of interrupt status
     ! ====================================================
 
     ! data structure to store the incoming data
@@ -80,23 +80,27 @@ MODULE commModule
                 initialRun := FALSE;
             ELSE
                 ! ====================================================
-                ! PHASE 1: CHECK FOR INTERRUPTS AND SEND APPROPRIATE ACK
+                ! PHASE 1: UNIFIED ACKNOWLEDGMENT PROTOCOL
                 ! ====================================================
-                IF wasInterrupted_R1 OR wasInterrupted_R2 THEN
-                    ! Motion was interrupted by DI signal
-                    TPWrite "Execution interrupted - Sending ACK_SKIPPED";
-                    SocketSend client_socket\str:='ACK_SKIPPED';
+                ! After BOTH ROB1 and ROB2 have completed (or been interrupted),
+                ! send a single unified acknowledgment to the client.
+                ! This maintains synchronization for the multimove system.
+                ! ====================================================
 
-                    ! Reset interrupt flags
-                    wasInterrupted_R1 := FALSE;
-                    wasInterrupted_R2 := FALSE;
+                ! Log interrupt status for diagnostics
+                IF wasInterrupted_R1 OR wasInterrupted_R2 THEN
+                    TPWrite "*** Motion interrupted (R1: "\Bool:=wasInterrupted_R1\", R2: "\Bool:=wasInterrupted_R2")";
                 ELSE
-                    ! Normal completion
-                    TPWrite "Done execution - Sending ACK_DONE";
-                    SocketSend client_socket\str:='ACK_DONE';
-                    ! Backward compatibility: Also support original format
-                    ! SocketSend client_socket\str:='9,9,9,9,9,9';
+                    TPWrite "Motion completed successfully for both robots";
                 ENDIF
+
+                ! Send unified acknowledgment (same message regardless of interrupt)
+                TPWrite "Sending acknowledgment to client";
+                SocketSend client_socket\str:='ACK_DONE';
+
+                ! Reset interrupt flags for next cycle
+                wasInterrupted_R1 := FALSE;
+                wasInterrupted_R2 := FALSE;
 
                 stateChoice_prev := stateChoice; ! store the previous state choice for comparison
             ENDIF
@@ -121,8 +125,7 @@ MODULE commModule
                 ELSE
                     TPWrite "Same state choice as before, not executing motion";
                     initialRun := TRUE; ! reset the initial run flag to avoid skipping the next execution
-                    SocketSend client_socket\str:='ACK_DONE'; ! send acknowledgment (no motion executed)
-                    ! Note: Using ACK_DONE for consistency with PHASE 1 interrupt protocol
+                    SocketSend client_socket\str:='ACK_DONE'; ! send unified acknowledgment (no motion executed)
                 ENDIF
 
                 TPWrite "Waiting for next client data...";
