@@ -6,8 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 
 **CURRENT STATUS**: PHASE 2 first draft implemented (2026-02-09). Single-point joint streaming for ROB1.
-**PHASE 1 STATUS**: Pending full validation (implementation complete, awaiting user verification)
-**NEXT STEP**: PHASE 2 verification, then circular buffer iteration
+**PHASE 1 STATUS**: Revised to ExitCycle approach (2026-02-10). RAISE cannot escape TRAP — confirmed via systematic testing.
+**NEXT STEP**: PHASE 1 ExitCycle verification in RobotStudio, then PHASE 2 verification
 
 ## Project Overview
 
@@ -34,7 +34,7 @@ This is a Handshake Platform between Python and ABB RobotStudio involving **THRE
 ### PHASE 1 (PENDING_UNTIL_FULL_VALIDATION): Interrupt-driven feedback for the ROBOT
 - **Goal**: Implement the digital input interrupt inside the nested loop of RAPID script.
 - **Action**: Given the RAPID script, you are to modify it accordingly with all the context you have.
-- **Status**: ⏳ Implementation revised on 2026-02-09 - Awaiting user verification in RobotStudio
+- **Status**: ⏳ Revised to ExitCycle approach on 2026-02-10 (RAISE approach failed — see implementation history)
 ### PHASE 2 (ACTIVE_PHASE): Enable Streaming feature (Python + RAPID)
 - **Goal**: Use the "The Leaky Bucket" architecture for data streaming between python script and ABB RAPID code.
 - **Action**: Create a sample python code for handshaking such that, PHASE 3 can use this to accomplish the handshake.
@@ -214,114 +214,91 @@ The system must implement a **unified acknowledgment** approach, NOT separate AC
 
 ## PHASE 1 - IMPLEMENTATION HISTORY
 
-### Date: 2026-02-09 (Revised)
+### Date: 2026-02-10 (Revised: ExitCycle Approach)
 ### Status: ⏳ AWAITING USER VERIFICATION
 
-#### Implementation Summary
-Successfully implemented the "Global Eject" interrupt strategy across all RAPID modules with decoupled architecture and unified acknowledgment protocol:
+#### RAISE Approach — Failed (2026-02-09 to 2026-02-10)
 
-**Revisions Completed:**
-1. ✅ Implemented unified acknowledgment (single ACK_DONE message regardless of interrupt status)
-2. ✅ Confirmed synchronization logic waits for BOTH ROB1 and ROB2 to complete before acknowledgment
-3. ✅ Updated system architecture documentation (added ROB3/server_cobot.py context)
+Gemini's suggested "Global Eject" strategy used `RAISE` from inside a TRAP handler to bubble an error up through the call chain to an ERROR handler. Systematic testing in RobotStudio confirmed this **cannot work**:
+
+| Error Type | Result |
+|-----------|--------|
+| Custom error (BookErrNo) | Event 40229 "Unhandled error" — RAISE fires but no handler is reachable from TRAP context |
+| Built-in error (ERR_ARGVALERR=1092) | Event 40199 "Illegal error number" — built-in errors are outside RAISE range (1-90) |
+| With/without StopMove/ClearPath | Same failure — the motor sequence is not the cause |
+
+**Root cause**: A TRAP routine runs in a separate execution context. `RAISE` inside a TRAP has no path to the interrupted routine's ERROR handlers. This is a fundamental RAPID limitation, not a configuration issue.
+
+Test scripts preserved in `reference/TestInterrupt_R1.mod` and findings in `reference/discussion_w_gemini.md`.
+
+#### ExitCycle Approach — Current Implementation (2026-02-10)
+
+Instead of trying to bubble an error, `ExitCycle` terminates the entire execution cycle and restarts from `main()`. A PERS flag tells `main()` to skip initialization and go straight to the idle loop.
+
+**How It Works:**
+1. **Initialization** (fresh start only): `Setup_Interrupt_Rx()` connects DI signal to TRAP handler, `assignWaypoints`, `state_HOME`
+2. **Normal Operation**: Motion executes via `Run_Motion_Manager_Rx()`, no ERROR wrappers needed
+3. **Interrupt Triggered**:
+   - DI signal fires → `trap_handle_stop_Rx` executes immediately
+   - Physical stop: StopMove → ClearPath → StartMove
+   - Set PERS flags: `wasInterrupted_Rx := TRUE`, `executionNotCompleted_Rx := FALSE`
+   - `ExitCycle` → program restarts from main()
+4. **Restart**: main() sees `wasInterrupted_Rx == TRUE` → skips assignWaypoints/state_HOME → goes to KeepLooping
+5. **Unified Acknowledgment** (unchanged):
+   - commModule waits for BOTH `executionNotCompleted_R1` and `_R2` to become FALSE
+   - Logs interrupt status for diagnostics
+   - Sends single unified `"ACK_DONE"` to clientUI.py
+   - Resets wasInterrupted flags for next cycle
+
+**Key Design Decisions:**
+- `ExitCycle` clears interrupt connections → must re-run IDelete/CONNECT/ISignalDI on every main() restart
+- `IDelete` isolated in its own `Safe_IDelete_Rx()` proc with `ERROR TRYNEXT` to avoid skipping CONNECT/ISignalDI
+- No BookErrNo, no ERROR relay handlers, no safety-net ERROR handlers needed — ExitCycle bypasses the entire call chain
+- **Interrupt-aware WaitSyncTask**: Both `Run_Motion_Manager_R1` and `_R2` check `wasInterrupted_R1` and `wasInterrupted_R2` before entering `WaitSyncTask`. If either robot was interrupted and ExitCycled, it will never reach the sync point — the other robot must skip sync to avoid deadlock.
+- **SyncMoveOn incompatible with ExitCycle interrupt**: During `SyncMoveOn` coordinated motion (`\ID` moves), one robot's ExitCycle leaves the other robot's motion instruction permanently stuck at the motion planner level. `SyncMoveUndo` only exits sync mode for the calling task — it does NOT release the other robot. The blocked robot may not even process DI interrupts while stuck in the motion planner. **Solution**: Replace `SyncMoveOn`/`SyncMoveOff`/`\ID` with `WaitSyncTask` + independent moves for any motion that needs to be interruptible. This trades path-coordinated motion for task-level synchronization at start/end points.
+- **Cross-task PERS**: Each MainModule declares the other robot's `wasInterrupted` flag as PERS for the WaitSyncTask check (R1 declares `wasInterrupted_R2`, R2 declares `wasInterrupted_R1`)
+- **wasInterrupted flag reset guarantee**: commModule resets `wasInterrupted_R1` and `_R2` to FALSE in three places: (1) `commMain()` startup, (2) "I" handshake handler, (3) after ACK_DONE is sent. This ensures flags are clean for the next DI interrupt cycle regardless of how the system enters its current state.
 
 #### Files Modified
 
 **1. MainModule_ROB1.mod** (`/ABB RAPID/MainModule_ROB1.mod`)
-- Added interrupt configuration constants:
-  - `ERR_INTERRUPT := 99` (custom error code)
-  - `DI_INTERRUPT_SIGNAL` (configurable DI signal name)
-  - `ir_stop_trigger_R1` (interrupt trigger variable)
-  - `wasInterrupted_R1` (PERS flag shared with commModule)
-
-- Created `Setup_Interrupt_R1()` procedure:
-  - Initializes interrupt system with IDelete/CONNECT/ISignalDI
-  - Includes error handling for common setup issues (ERR_INOMAX, ERR_SIGSUPSEARCH)
-
-- Created `Run_Motion_Manager_R1()` procedure:
-  - Wraps existing motion execution with ERROR handler
-  - Implements Global Eject pattern: catches ERR_INTERRUPT → sets wasInterrupted_R1 → RETURNs cleanly
-  - Resets interrupt flag at start of each motion sequence
-
-- Created `trap_handle_stop_R1` TRAP handler:
-  - Physical interrupt service routine triggered by DI signal
-  - Sequence: StopMove → ClearPath → StartMove → RAISE ERR_INTERRUPT
-  - Enables immediate motor stop and clean path clearing
-
-- Modified `KeepLooping()` procedure:
-  - Integrated Run_Motion_Manager_R1 call for motion execution
-  - Added conditional execution flag reset (only if not interrupted)
+- `main()`: Checks `wasInterrupted_R1` to skip init on ExitCycle restart
+- `Setup_Interrupt_R1()`: Uses `Safe_IDelete_R1()`, always re-configures (no caching)
+- `Safe_IDelete_R1()`: New helper proc with `ERROR TRYNEXT`
+- `trap_handle_stop_R1`: StopMove → ClearPath → StartMove → set flags → ExitCycle
+- `Run_Motion_Manager_R1()`: Interrupt-aware WaitSyncTask (checks both wasInterrupted flags before sync)
+- Added `PERS bool wasInterrupted_R2` for cross-task sync check
+- Removed: `VAR errnum`, `BookErrNo`, all `ERROR` handlers for interrupt, `ERROR RAISE` relay in executeState
 
 **2. MainModule_ROB2.mod** (`/ABB RAPID/MainModule_ROB2.mod`)
-- Applied identical interrupt implementation as R1 (R2-specific naming)
-- All components mirrored: Setup_Interrupt_R2, Run_Motion_Manager_R2, trap_handle_stop_R2
-- Maintains symmetry for dual-robot multimove operation
+- Identical changes mirrored with R2 naming
+- Added `PERS bool wasInterrupted_R1` for cross-task sync check
 
 **3. commModule.mod** (`/ABB RAPID/commModule.mod`)
-- Added PERS declarations for interrupt status:
-  - `wasInterrupted_R1` and `wasInterrupted_R2` flags (shared with MainModules)
-
-- ✅ **REVISED:** Unified acknowledgment protocol in `cmdExe()`:
-  - ✅ Waits for BOTH ROB1 and ROB2 to complete (via `WHILE executionNotCompleted_R1 OR executionNotCompleted_R2` loop)
-  - ✅ Sends single unified `"ACK_DONE"` message regardless of interrupt status
-  - ✅ Logs interrupt status for diagnostics before sending acknowledgment
-  - ✅ Resets interrupt flags after acknowledgment for next cycle
+- `commMain()`: Resets `wasInterrupted_R1` and `_R2` to FALSE at startup
+- `updateGlobalVariable()` CASE "I": Resets both flags on client handshake
+- Existing post-ACK_DONE reset (lines 119-120) retained for normal cycle cleanup
 
 #### Architecture Integrity
-✅ **Decoupling Maintained**: Communication logic remains in commModule, motion logic in MainModules
-✅ **Synchronization Implemented**: commModule waits for both ROB1 and ROB2 before acknowledgment
-✅ **Unified Acknowledgment**: Single ACK_DONE message sent regardless of interrupt status
-✅ **Multimove Compatibility**: Both robots independently handle interrupts, flags tracked separately
-✅ **No Python Changes Required**: Backward compatible - clientUI.py receives ACK_DONE as before
+✅ **Decoupling Maintained**: Communication logic in commModule, motion logic in MainModules
+✅ **Synchronization**: commModule waits for both ROB1 and ROB2 before ACK
+✅ **Unified Acknowledgment**: Single ACK_DONE regardless of interrupt status
+✅ **Backward Compatible**: No Python changes required
+✅ **Simpler**: No BookErrNo, no ERROR relay chain, no safety-net handlers
 
-#### Configuration Required Before Use
-⚠️ **CRITICAL**: Configure DI signal name in both MainModule files:
+#### Configuration Required
+⚠️ Configure DI signal name in both MainModule files:
 ```rapid
 CONST string DI_INTERRUPT_SIGNAL := "diInterruptSignal";
 ```
-Replace with actual signal name from I/O System Configuration (e.g., "diEmergencyStop", "diSafetyStop")
-
-#### How It Works (Revised Implementation - Awaiting Verification)
-1. **Initialization**: `Setup_Interrupt_Rx()` connects DI signal to TRAP handler at startup
-2. **Normal Operation**: Motion executes via `Run_Motion_Manager_Rx()` with ERROR protection
-3. **Interrupt Triggered**:
-   - DI signal fires → `trap_handle_stop_Rx` executes immediately
-   - Physical stop: StopMove → ClearPath → StartMove
-   - Logic jump: RAISE ERR_INTERRUPT
-4. **Error Bubbling**: ERR_INTERRUPT caught by Run_Motion_Manager_Rx ERROR handler
-5. **Clean Exit**: Sets wasInterrupted flag, resets execution flag, RETURNs to idle
-6. ✅ **Unified Acknowledgment**:
-   - commModule waits for BOTH `executionNotCompleted_R1` and `executionNotCompleted_R2` to become FALSE
-   - Logs interrupt status for diagnostics (R1 and R2 interrupt flags)
-   - Sends single unified `"ACK_DONE"` acknowledgment to clientUI.py
-   - Resets interrupt flags for next cycle
 
 #### Testing Checklist
 - [ ] Configure DI signal name in both MainModule files (default: "diInterruptSignal")
 - [ ] Load modified modules into robot controller (T_ROB1, T_ROB2, T_COMM tasks)
-- [ ] **Test 1 - Normal Operation**: Execute motion without interrupt
-  - [ ] Verify both robots complete motion successfully
-  - [ ] Verify clientUI.py receives "ACK_DONE"
-  - [ ] Check FlexPendant logs show "Motion completed successfully"
-- [ ] **Test 2 - ROB1 Interrupt**: Trigger DI signal on ROB1 during motion
-  - [ ] Verify ROB1 stops immediately and executes TRAP handler
-  - [ ] Verify commModule waits for BOTH ROB1 and ROB2 to complete
-  - [ ] Verify clientUI.py receives unified "ACK_DONE" (not separate signal)
-  - [ ] Check FlexPendant logs show interrupt status for diagnostics
-  - [ ] Verify robot accepts next command immediately
-- [ ] **Test 3 - ROB2 Interrupt**: Trigger DI signal on ROB2 during motion
-  - [ ] Verify ROB2 stops immediately and executes TRAP handler
-  - [ ] Verify commModule waits for BOTH ROB1 and ROB2 to complete
-  - [ ] Verify clientUI.py receives unified "ACK_DONE"
-  - [ ] Check FlexPendant logs show interrupt status for diagnostics
-  - [ ] Verify robot accepts next command immediately
-- [ ] **Test 4 - Dual Interrupt**: Trigger DI signals on both robots simultaneously
-  - [ ] Verify both robots stop and handle interrupts
-  - [ ] Verify unified acknowledgment sent only once
-  - [ ] Verify system recovers and accepts next command
-
-#### Next Phase
-PHASE 2 preparation requires PHASE 1 interrupt system to be fully tested, verified, and operational in production environment.
+- [ ] **Test 1 - Normal Operation**: Execute motion without interrupt → ACK_DONE received
+- [ ] **Test 2 - ROB1 Interrupt**: Trigger DI on ROB1 → robot stops, "RESTARTED AFTER INTERRUPT" on FlexPendant, ACK_DONE received, next command works
+- [ ] **Test 3 - ROB2 Interrupt**: Same as Test 2 for ROB2
+- [ ] **Test 4 - Dual Interrupt**: Trigger both → both stop, single ACK_DONE, system recovers
 
 ---
 

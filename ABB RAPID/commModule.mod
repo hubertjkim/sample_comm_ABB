@@ -70,6 +70,8 @@ MODULE commModule
         TPErase;
         executionNotCompleted_R1 := FALSE;
         executionNotCompleted_R2 := FALSE;
+        wasInterrupted_R1 := FALSE;
+        wasInterrupted_R2 := FALSE;
         reconnectComm := FALSE;
         initialRun := TRUE;
         cmdExe;
@@ -194,6 +196,8 @@ MODULE commModule
             stateChoice := receivedDataPkg.selectedState;
         CASE "I":
             TPWrite "TCP/IP connection established with client at IP";
+            wasInterrupted_R1 := FALSE;
+            wasInterrupted_R2 := FALSE;
             SocketSend client_socket\str:='1,1,1,1,1,1'; ! send a signal to the client that the connection is established
         CASE "T":
             TPWrite "TCP/IP connection closed";

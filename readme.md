@@ -50,3 +50,92 @@
   - Verify in RobotStudio (testing checklist in CLAUDE.md)
   - After validation, implement the circular buffer for continuous streaming without
   per-point ACK wait
+  
+  
+  
+In RAPID, RAISE from a TRAP does not auto-bubble at all. 
+  The error lands in the exact routine that was executing the motion instruction, and if  
+  that routine has no ERROR handler, it's immediately "unhandled" — full stop, no further 
+  propagation.                                                                          
+                                                                                          
+  So every routine in the call chain between the motion instruction and Run_Motion_Manager
+   needs ERROR RAISE;. The relay chain must be unbroken:                                  
+                                                                                          
+  TRAP → RAISE                                                                            
+    → customMove():  ERROR RAISE;    ← catches, re-raises to caller                       
+    → state_STANDBY(): ERROR RAISE;  ← catches, re-raises to caller
+    → executeState():  ERROR RAISE;  ← catches, re-raises to caller  (already done)
+    → Run_Motion_Manager_R1(): catches ERR_INTERRUPT_R1, handles it
+
+  Every routine that directly contains a motion instruction (MoveJ, MoveL, MoveAbsJ, etc.)
+   or calls another routine that does, needs the ERROR RAISE; relay.
+
+======================================================
+
+
+
+Current RAISE Approach (what we wanted)                                                 
+   
+  DI fires → TRAP → RAISE → ERROR handler in Run_Motion_Manager_R1                        
+    → sets wasInterrupted_R1 := TRUE                                                    
+    → sets executionNotCompleted_R1 := FALSE                                           
+    → RETURN                                                                          
+    → back in KeepLooping (idle, WHILE TRUE, waiting for next newTargetFlag_R1)
+    → commModule sees executionNotCompleted_R1 == FALSE → sends ACK_DONE
+    → Python gets ACK → sends next command → cycle continues
+
+  ExitCycle Approach (same result)
+
+  DI fires → TRAP → StopMove → ClearPath → StartMove
+    → sets wasInterrupted_R1 := TRUE
+    → sets executionNotCompleted_R1 := FALSE
+    → ExitCycle
+    → main() restarts
+    → sees wasInterrupted_R1 == TRUE → skips init → jumps to KeepLooping
+    → KeepLooping (idle, WHILE TRUE, waiting for next newTargetFlag_R1)
+    → commModule sees executionNotCompleted_R1 == FALSE → sends ACK_DONE
+    → Python gets ACK → sends next command → cycle continues
+
+  From step 4 onward, the behavior is identical. The robot is idle in KeepLooping,
+  commModule sends ACK_DONE, Python sends the next command. The only difference is how we
+  got back to KeepLooping — error bubbling vs. ExitCycle restart.
+
+  Here's what the production main() would look like:
+
+  PROC main()
+      IF wasInterrupted_R1 THEN
+          ! ExitCycle restart — skip all init, go straight to idle
+          TPWrite "R1: Restarted after interrupt";
+          wasInterrupted_R1 := FALSE;
+          KeepLooping;
+      ENDIF
+
+      ! Normal first-run path (only runs once)
+      TPErase;
+      TPWrite "R1: Main module started.";
+      Setup_Interrupt_R1;
+      assignWaypoints;
+      ConfJ \Off;
+      state_HOME;
+      ConfJ \On;
+      KeepLooping;
+  ENDPROC
+
+  And the simplified TRAP (no RAISE, no ERROR relay chain needed):
+
+  TRAP trap_handle_stop_R1
+      StopMove;
+      ClearPath;
+      StartMove;
+      wasInterrupted_R1 := TRUE;
+      executionNotCompleted_R1 := FALSE;
+      ExitCycle;
+  ENDTRAP
+
+  What gets removed from the production code:
+  - BookErrNo / VAR errnum ERR_INTERRUPT_R1 — no custom error needed
+  - RAISE in TRAP — replaced by ExitCycle
+  - ERROR RAISE; relay in executeState — no error to relay
+  - ERROR IF ERRNO = ERR_INTERRUPT_R1 in Run_Motion_Manager_R1 — no error to catch
+  - ERROR ... TRYNEXT safety net in KeepLooping — ExitCycle bypasses it entirely
+
