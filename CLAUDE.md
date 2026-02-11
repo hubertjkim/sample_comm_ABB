@@ -6,8 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 
 **CURRENT STATUS**: PHASE 2 first draft implemented (2026-02-09). Single-point joint streaming for ROB1.
-**PHASE 1 STATUS**: Revised to ExitCycle approach (2026-02-10). RAISE cannot escape TRAP — confirmed via systematic testing.
-**NEXT STEP**: PHASE 1 ExitCycle verification in RobotStudio, then PHASE 2 verification
+**PHASE 1 STATUS**: VALIDATED (2026-02-10). ExitCycle approach works. SyncMoveOn replaced with WaitSyncTask + independent moves.
+**NEXT STEP**: PHASE 2 verification in RobotStudio
 
 ## Project Overview
 
@@ -31,10 +31,10 @@ This is a Handshake Platform between Python and ABB RobotStudio involving **THRE
 
 ## Phased Development Strategy
 
-### PHASE 1 (PENDING_UNTIL_FULL_VALIDATION): Interrupt-driven feedback for the ROBOT
+### PHASE 1 (VALIDATED): Interrupt-driven feedback for the ROBOT
 - **Goal**: Implement the digital input interrupt inside the nested loop of RAPID script.
 - **Action**: Given the RAPID script, you are to modify it accordingly with all the context you have.
-- **Status**: ⏳ Revised to ExitCycle approach on 2026-02-10 (RAISE approach failed — see implementation history)
+- **Status**: ✅ Validated 2026-02-10. ExitCycle approach with WaitSyncTask (replacing SyncMoveOn) confirmed working in RobotStudio.
 ### PHASE 2 (ACTIVE_PHASE): Enable Streaming feature (Python + RAPID)
 - **Goal**: Use the "The Leaky Bucket" architecture for data streaming between python script and ABB RAPID code.
 - **Action**: Create a sample python code for handshaking such that, PHASE 3 can use this to accomplish the handshake.
@@ -215,7 +215,7 @@ The system must implement a **unified acknowledgment** approach, NOT separate AC
 ## PHASE 1 - IMPLEMENTATION HISTORY
 
 ### Date: 2026-02-10 (Revised: ExitCycle Approach)
-### Status: ⏳ AWAITING USER VERIFICATION
+### Status: ✅ VALIDATED
 
 #### RAISE Approach — Failed (2026-02-09 to 2026-02-10)
 
@@ -293,12 +293,20 @@ CONST string DI_INTERRUPT_SIGNAL := "diInterruptSignal";
 ```
 
 #### Testing Checklist
-- [ ] Configure DI signal name in both MainModule files (default: "diInterruptSignal")
-- [ ] Load modified modules into robot controller (T_ROB1, T_ROB2, T_COMM tasks)
-- [ ] **Test 1 - Normal Operation**: Execute motion without interrupt → ACK_DONE received
-- [ ] **Test 2 - ROB1 Interrupt**: Trigger DI on ROB1 → robot stops, "RESTARTED AFTER INTERRUPT" on FlexPendant, ACK_DONE received, next command works
-- [ ] **Test 3 - ROB2 Interrupt**: Same as Test 2 for ROB2
-- [ ] **Test 4 - Dual Interrupt**: Trigger both → both stop, single ACK_DONE, system recovers
+- [x] Configure DI signal name in both MainModule files (default: "diInterruptSignal")
+- [x] Load modified modules into robot controller (T_ROB1, T_ROB2, T_COMM tasks)
+- [x] **Test 1 - Normal Operation**: Execute motion without interrupt → ACK_DONE received
+- [x] **Test 2 - ROB1 Interrupt**: Trigger DI → both robots stop, ExitCycle restart, ACK_DONE received, next command works
+- [x] **Test 3 - SyncMoveOn deadlock**: Confirmed — replaced with WaitSyncTask + independent moves
+- [x] **Test 4 - Final validation**: WaitSyncTask with interrupt-aware skip works correctly
+
+#### Lessons Learned (PHASE 1)
+1. **RAISE cannot escape TRAP** — fundamental RAPID limitation, not configuration
+2. **ExitCycle is the correct escape mechanism** — terminates cycle, restarts from main()
+3. **ExitCycle clears interrupt connections** — must always re-setup with Safe_IDelete pattern
+4. **SyncMoveOn is incompatible with ExitCycle interrupt** — motion planner coupling can't be broken from one side. SyncMoveUndo only frees calling task (Event 41633 restricts it to UNDO handlers anyway)
+5. **WaitSyncTask + independent moves** is the correct pattern for interruptible multi-robot motion
+6. **Interrupt-aware WaitSyncTask** — check wasInterrupted flags before every WaitSyncTask to prevent barrier deadlock
 
 ---
 
@@ -308,9 +316,21 @@ CONST string DI_INTERRUPT_SIGNAL := "diInterruptSignal";
 ### Status: ⏳ AWAITING USER VERIFICATION
 
 #### Implementation Summary
-First draft of joint streaming: establishes data structures, protocol (`"j"` header), mode toggling, and single-point `MoveAbsJ` execution for ROB1 only. The full circular buffer ("Leaky Bucket") will be layered on top in a subsequent iteration.
+First draft of joint streaming: establishes data structures, two-layer protocol dispatch, mode toggling, and single-point `MoveAbsJ` execution for ROB1 only. The full circular buffer ("Leaky Bucket") will be layered on top in a subsequent iteration.
 
-#### Protocol Format
+#### Two-Layer Protocol Architecture
+
+The system has two independent protocol layers. Mode switching happens at the ZMQ layer; the TCP/IP layer is header-driven and unchanged.
+
+**Layer 1: ZMQ (clientUI ↔ server_multiMove)** — dispatched by `elen` (message length)
+
+| `elen` | Mode | Data format | Description |
+|--------|------|-------------|-------------|
+| 3 | State motion | `(path, sequence, head_or_tail)` | Pre-defined path execution (existing) |
+| 6 | Joint streaming | `(j1, j2, j3, j4, j5, j6)` | 6 axis values in degrees (new) |
+| 3 | Termination | `(0, 0, 0)` | Shutdown command (existing) |
+
+**Layer 2: TCP/IP (server_multiMove ↔ commModule)** — dispatched by header character
 
 | Header | Format | Description |
 |--------|--------|-------------|
@@ -318,6 +338,10 @@ First draft of joint streaming: establishes data structures, protocol (`"j"` hea
 | `j` | `j;j1;j2;j3;j4;j5;j6;` | Joint streaming - 6 axis values in degrees (new) |
 | `I` | `I;...` | Connection handshake (existing) |
 | `T` | `T;...` | Termination (existing) |
+
+**Translation**: server_multiMove bridges the two layers:
+- `elen == 3` → `send_data(data_list, 'd;')` → RAPID receives `d;...`
+- `elen == 6` → `send_data(joint_values, 'j;')` → RAPID receives `j;...`
 
 #### Files Modified
 
@@ -344,11 +368,21 @@ First draft of joint streaming: establishes data structures, protocol (`"j"` hea
 - No motion changes for R2 in this first draft
 
 **4. server_multiMove.py** (`/PythonHMI/server_multiMove.py`)
-- Added `send_joint_stream()` function: sends `j;` prefixed joint values, waits for ACK_DONE
-- Added `run_streaming_test()` function: 20-point sine wave test on J1 (+/- 5 degrees, 2 Hz)
-- Integrated into main loop dispatch:
-  - `data[0] == 5`: single joint stream command (data format: `(5, j1, j2, j3, j4, j5, j6)`)
-  - `data[0] == 6`: run streaming test sequence
+- Added `send_joint_stream()` function: sends `j;` prefixed joint values to RAPID, waits for ACK_DONE
+- Added `run_streaming_test()` function: 20-point sine wave test on J1 — standalone utility for direct testing (bypasses ZMQ/clientUI, communicates directly with RAPID via TCP/IP)
+- **Revised (2026-02-10)**: Mode dispatch uses `elen` (message length), NOT `data[0]`:
+  - `elen == 3`: state motion `(path, sequence, head_or_tail)` — existing format preserved
+  - `elen == 6`: joint streaming `(j1, j2, j3, j4, j5, j6)` — no conflict with path numbers
+- **Bug fix**: Buffer size check used `struct.calcsize(fmt_elen)` (always 4) instead of `struct.calcsize(fmt_data)` (actual data size). Fixed in both startup and main loop checks.
+
+**5. clientUI.py** (`/PythonHMI/clientUI.py`)
+- **Added (2026-02-10)**: Streaming mode via 's' option in user input prompt
+- User input flow: `'y'` = state motion (existing), `'s'` = streaming mode (new), `'n'` = quit (existing)
+- Streaming sub-menu:
+  - Manual: enter 6 comma-separated joint values (e.g., `0,0,0,0,0,0`)
+  - Test: type `test` for 20-point sine wave on J1 (+/- 5 deg)
+  - Exit: type `q` to return to main menu
+- Packs joint values as `elen == 6` (6 doubles) for server_multiMove dispatch
 
 #### Architecture Decisions
 - **ROB1 only** for this first draft - R2 streaming will follow after validation
@@ -358,12 +392,12 @@ First draft of joint streaming: establishes data structures, protocol (`"j"` hea
 - **Decoupled architecture preserved** - commModule handles parsing/routing, MainModule_ROB1 handles motion
 
 #### Testing Checklist
-- [ ] Load modified modules into robot controller
-- [ ] **Test 1 - Standard Regression**: Send "d" packet, verify existing motion still works
-- [ ] **Test 2 - Joint Stream**: Send "j" packet with known joint values, verify R1 moves to position
-- [ ] **Test 3 - Mode Switch**: Send "d" then "j" then "d", verify mode toggles correctly
-- [ ] **Test 4 - Interrupt During Stream**: Trigger DI during joint stream motion, verify PHASE 1 interrupt works
-- [ ] **Test 5 - Python Integration**: Run `run_streaming_test()`, verify 20-point oscillation executes
+- [ ] Load modified RAPID modules into robot controller
+- [ ] **Test 1 - Standard Regression**: clientUI → 'y' → path selection → verify existing state motion works
+- [ ] **Test 2 - Joint Stream (manual)**: clientUI → 's' → enter `0,0,0,0,0,0` → verify R1 moves to position
+- [ ] **Test 3 - Joint Stream (test)**: clientUI → 's' → type `test` → verify 20-point sine wave on J1
+- [ ] **Test 4 - Mode Switch**: Run state motion ('y'), then streaming ('s'), then state motion again
+- [ ] **Test 5 - Interrupt During Stream**: Trigger DI during joint stream motion, verify PHASE 1 works
 
 #### Next Iteration
 After validation, implement the circular buffer ("Leaky Bucket") for continuous streaming without per-point ACK wait.

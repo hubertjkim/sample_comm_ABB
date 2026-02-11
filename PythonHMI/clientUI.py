@@ -10,6 +10,7 @@ from config.constatns import (
     object_group_1,
     object_group_2,
 )
+import math
 import csv
 
 
@@ -181,7 +182,7 @@ def main() -> None:
 
             while True:
                 try:
-                    userInput_execution = input("Do you want to continue executing the program? (y/n): ")
+                    userInput_execution = input("Enter 'y' for state motion, 's' for streaming, 'n' to quit: ")
 
                     if userInput_execution.lower() == 'y':
                         userPathSelection = input ("Input desired path for the robot to execute (1 or 2):  ")
@@ -200,7 +201,53 @@ def main() -> None:
                         stateExeList.travers_and_execute(stateExeList.head, userPathSelection,
                                                          socket_int_multiMove_send, socket_int_multiMove_recv,
                                                          socket_int_cobot_send, socket_int_cobot_recv)
-                    
+
+                    elif userInput_execution.lower() == 's':
+                        # PHASE 2: Joint streaming mode
+                        print("Streaming mode. Enter 6 comma-separated joint values (e.g., 0,0,0,0,0,0)")
+                        print("  'test' - Run 20-point sine wave test on J1 (+/- 5 deg)")
+                        print("  'q'    - Return to main menu")
+                        streaming = True
+                        while streaming:
+                            stream_input = input("Stream> ")
+                            if stream_input.lower() == 'q':
+                                streaming = False
+                            elif stream_input.lower() == 'test':
+                                # 20-point sine wave on J1, safe amplitude
+                                base_joints = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                                t = 0
+                                print("Running 20-point sine wave test...")
+                                for i in range(20):
+                                    joints = base_joints.copy()
+                                    joints[0] = 5.0 * math.sin(t)
+                                    dataPkg = struct.pack("!I" + "d" * 6, 6, *joints)
+                                    socket_int_multiMove_send.send(dataPkg)
+                                    print(f"  Point {i+1}/20: J1={joints[0]:.2f}")
+                                    try:
+                                        ack = socket_int_multiMove_recv.recv(MAX_PACKET_SIZE)
+                                        print(f"  ACK received")
+                                    except zmq.Again:
+                                        print(f"  ACK timeout")
+                                    t += 0.3
+                                    time.sleep(0.5)
+                                print("Streaming test completed.")
+                            else:
+                                try:
+                                    joints = [float(x.strip()) for x in stream_input.split(',')]
+                                    if len(joints) == 6:
+                                        dataPkg = struct.pack("!I" + "d" * 6, 6, *joints)
+                                        socket_int_multiMove_send.send(dataPkg)
+                                        print(f"Sent: {joints}")
+                                        try:
+                                            ack = socket_int_multiMove_recv.recv(MAX_PACKET_SIZE)
+                                            print("ACK received")
+                                        except zmq.Again:
+                                            print("ACK timeout")
+                                    else:
+                                        print(f"Need 6 values, got {len(joints)}")
+                                except ValueError:
+                                    print("Invalid input. Use comma-separated numbers.")
+
                     else:
                         # send termination code to the connected servers before breaking the loop and terminating the program
                         stateMachineKeyword = [0,0,0] # 0 for termination

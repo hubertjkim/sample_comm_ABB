@@ -149,7 +149,7 @@ def main()->None:
                 elen = struct.unpack(fmt_elen, message)[0]
                 fmt_data = "!" + "d" * elen
                 # Ensure the buffer is large enough to contain the expected data
-                if len(message) == struct.calcsize(fmt_elen) + PACKET_OFFSET:
+                if len(message) == struct.calcsize(fmt_data) + PACKET_OFFSET:
                     data = struct.unpack(fmt_data, message, PACKET_OFFSET)
                     if data == (2, 2, 2): # Real Controller, RC
                         print("Connected to Real Controller.")
@@ -191,7 +191,7 @@ def main()->None:
                         elen = struct.unpack(fmt_elen, message)[0]
                         fmt_data = "!" + "d" * elen
                         # Ensure the buffer is large enough to contain the expected data
-                        if len(message) == struct.calcsize(fmt_elen) + PACKET_OFFSET:
+                        if len(message) == struct.calcsize(fmt_data) + PACKET_OFFSET:
                             data = struct.unpack(fmt_data, message, PACKET_OFFSET)
                             if data == (0, 0, 0): # termination command from client
                                 print("Termination command received from client. Exiting...")
@@ -205,24 +205,25 @@ def main()->None:
                                     sys.exit()
                             
                             else:
-                                # forever loop begins here:
+                                # Dispatch based on message length (elen):
+                                # elen == 3: state motion from clientUI (path, sequence, head_or_tail)
+                                # elen == 6: joint streaming (j1, j2, j3, j4, j5, j6)
                                 if not internal_socket_only:
-                                    if int(data[0]) == 5:
+                                    if elen == 6:
                                         # PHASE 2: Joint streaming mode
-                                        # data format: (5, j1, j2, j3, j4, j5, j6)
-                                        joint_values = [float(data[i]) for i in range(1, min(len(data), 7))]
-                                        if len(joint_values) == 6:
-                                            send_joint_stream(joint_values, socket_ext_Multimove)
-                                        else:
-                                            print(f"Invalid joint stream data length: {len(joint_values)}, expected 6")
-                                    elif int(data[0]) == 6:
-                                        # PHASE 2: Run streaming test
-                                        run_streaming_test(socket_ext_Multimove)
-                                    elif not previous_sequence == data[1]:
-                                        # Standard state motion dispatch
-                                        send_command_to_external_socket(int(data[0]), int(data[1]), tempClientState, socket_ext_Multimove)
-                                        previous_sequence = data[1]
-                                        wasPreviousExecutionSuccessful = True
+                                        joint_values = [float(data[i]) for i in range(6)]
+                                        print(f'[Joint Stream] joints: {joint_values}')
+                                        send_joint_stream(joint_values, socket_ext_Multimove)
+                                    elif elen == 3:
+                                        # State motion: data = (path, sequence, head-1 or tail-3)
+                                        print(f'[State Motion] path: {data[0]}, sequence: {data[1]}, head/tail: {data[2]}')
+                                        # Only send if sequence changed (skip consecutive identical sequences)
+                                        if not previous_sequence == data[1]:
+                                            send_command_to_external_socket(int(data[0]), int(data[1]), tempClientState, socket_ext_Multimove)
+                                            previous_sequence = data[1]
+                                            wasPreviousExecutionSuccessful = True
+                                    else:
+                                        print(f'[Unknown] elen={elen}, data={data}')
 
                                 # send back the acknowledgement
                                 acknowledgeToClient = [99,99,99]

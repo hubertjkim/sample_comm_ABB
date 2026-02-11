@@ -139,3 +139,23 @@ Current RAISE Approach (what we wanted)
   - ERROR IF ERRNO = ERR_INTERRUPT_R1 in Run_Motion_Manager_R1 — no error to catch
   - ERROR ... TRYNEXT safety net in KeepLooping — ExitCycle bypasses it entirely
 
+===================================
+Function usage
+  ┌────────────────────────────┬─────────────────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │          Function          │      Location       │                                                         Usage                                                         │
+  ├────────────────────────────┼─────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ send_joint_stream()        │ server_multiMove.py │ Called automatically by main loop when elen == 6. Sends j; prefix to RAPID, waits for ACK_DONE.                       │
+  ├────────────────────────────┼─────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ run_streaming_test()       │ server_multiMove.py │ Standalone utility — communicates directly with RAPID via TCP/IP (bypasses ZMQ). For direct testing without clientUI. │
+  ├────────────────────────────┼─────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Streaming test in clientUI │ clientUI.py         │ Full-pipeline test — sends 20 points through ZMQ → server_multiMove → RAPID. Use 's' then 'test' from the UI.         │
+  └────────────────────────────┴─────────────────────┴───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  RAPID code changes
+
+  Not needed. The two protocol layers are independent:
+  - ZMQ layer (clientUI ↔ server_multiMove): dispatched by elen — this is where the change happened
+  - TCP/IP layer (server_multiMove ↔ commModule): dispatched by header character ("d", "j", "I", "T") — unchanged
+
+  server_multiMove translates between them: elen==6 → send_data(joints, 'j;') → RAPID receives j;j1;j2;.... The commModule ParseMessage, updateGlobalVariable, and cmdExe already handle
+   "j" correctly from the first draft.
