@@ -70,6 +70,7 @@ def main()->None:
     # socket to talk to client
     print("Initializing external CB socket server...")
     soceketClient_receive = context.socket(zmq.PULL)
+    soceketClient_receive.setsockopt(zmq.RCVTIMEO, 5000)  # 5s timeout so Ctrl+C can interrupt
     soceketClient_receive.connect("tcp://localhost:8080")
     soceketClient_send = context.socket(zmq.PUSH)
     soceketClient_send.connect("tcp://localhost:8081")
@@ -83,7 +84,10 @@ def main()->None:
     # 1. Listen to the lcient & Connect to robot, see if this is VC or RC
     toggle_listeningFromClient = False
     while not toggle_listeningFromClient:
-        message  = soceketClient_receive.recv(MAX_PACKET_SIZE)
+        try:
+            message = soceketClient_receive.recv(MAX_PACKET_SIZE)
+        except zmq.Again:
+            continue
         if not message is None:
             # Ensure the specific buffer size
             if len(message) >= struct.calcsize(fmt_elen):
@@ -125,7 +129,10 @@ def main()->None:
             # 3. Always check the terminaation condition first:
             toggle_listeningFromClient = False
             while not toggle_listeningFromClient:
-                message  = soceketClient_receive.recv(MAX_PACKET_SIZE)
+                try:
+                    message = soceketClient_receive.recv(MAX_PACKET_SIZE)
+                except zmq.Again:
+                    continue
                 if not message is None:
                     # Ensure the specific buffer size
                     if len(message) >= struct.calcsize(fmt_elen):
@@ -135,16 +142,9 @@ def main()->None:
                         if len(message) == struct.calcsize(fmt_elen) + PACKET_OFFSET:
                             data = struct.unpack(fmt_data, message, PACKET_OFFSET)
                             if data == (0, 0, 0): # termination command from client
-                                print("Termination command received from client. Exiting...")
+                                print("Termination command received from client.")
+                                break  # exit to cleanup below
 
-                                if not internal_socket_only:
-                                    # send out the "close socket command"
-                                    socket_ext_Cobot.send_data([0,0,0], 'T;') 
-                                    socket_ext_Cobot.close_socket()
-                                    soceketClient_receive.close()
-                                    soceketClient_send.close()
-                                    sys.exit()
-                            
                             else:
                                 # forever loop begins here:
                                 if not internal_socket_only:
@@ -168,7 +168,23 @@ def main()->None:
                 print("No data received, continuing to listen...")
                 continue
             else:
-                raise  # re-raise the exception if it's not EAGAIN
+                raise
+        except KeyboardInterrupt:
+            print("\nCtrl+C detected. Shutting down...")
+            break
+
+    # Cleanup: close all sockets regardless of how we exited the loop
+    print("Cleaning up sockets...")
+    try:
+        if not internal_socket_only:
+            socket_ext_Cobot.send_data([0,0,0], 'T;')
+            socket_ext_Cobot.close_socket()
+    except Exception:
+        pass
+    soceketClient_receive.close()
+    soceketClient_send.close()
+    context.term()
+    print("Server shutdown complete.")
 
 if __name__ == "__main__":
     main()
