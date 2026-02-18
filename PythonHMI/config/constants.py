@@ -46,6 +46,8 @@ object_group_1: Set[str] = {"object1", "object2", "object3"}
 object_group_2: Set[str] = {"object4", "object5", "object6"}
 object_group_3: Set[str] = {"object7", "object8", "object9"}
 
+STREAMING_STATE_NAME = "Stream"
+
 def lookup_tool_mm(selected_path: str) -> str:
     """Lookup the tool for multimove based on the selected path"""
     match selected_path:

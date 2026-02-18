@@ -1,17 +1,18 @@
-import socket
 import zmq
 import subprocess
 import time
 import struct
 import sys
 from typing import Optional
-from src.communication.data_structure import LinedList
-from config.constatns import (
+from src.communication.data_structures import LinkedList
+from src.communication.protocol import pack_data, unpack_data
+from config.constants import (
     object_group_1,
     object_group_2,
+    STREAMING_STATE_NAME,
 )
+from config.settings import Config
 import math
-import csv
 
 
 socket_int_multiMove_send: Optional[zmq.Socket] = None
@@ -25,8 +26,88 @@ PATH_TO_COBOT = r"PythonHMI/server_cobot.py"
 
 is_this_simulation = True
 MAX_PACKET_SIZE = 1024
-fmt_elen = '!I'  # Format 
+fmt_elen = '!I'  # Format
 PACKET_OFFSET = 4  # Number of bytes used to store the length of the packet. 4 Is the size of an unsigned int (4 bytes)
+
+
+def interactive_streaming_handler(socket_send: zmq.Socket, socket_recv: zmq.Socket,
+                                  max_points: int = 0) -> None:
+    """Interactive streaming handler for PHASE 2 testing.
+
+    Provides a sub-menu for manual joint input, sine-wave test, or 'q' to exit.
+    Used both from the top-level 's' menu and as a callback for Stream nodes
+    in traverse_and_execute.
+
+    Args:
+        socket_send: ZMQ PUSH socket to the MultiMove server
+        socket_recv: ZMQ PULL socket from the MultiMove server
+        max_points: 0 = open-ended (only 'q' exits), >0 = auto-terminate after N points.
+                    Operator can always type 'q' to exit early.
+    """
+    print("--- Streaming mode ---")
+    print("Enter 6 comma-separated joint values (e.g., 0,0,0,0,0,0)")
+    print("  'test' - Run 20-point sine wave test on J1 (+/- 5 deg)")
+    print("  'q'    - Return to state mode")
+    if max_points > 0:
+        print(f"  Auto-exit after {max_points} points")
+
+    points_sent = 0
+    streaming = True
+    while streaming:
+        # Auto-terminate check
+        if max_points > 0 and points_sent >= max_points:
+            print(f"Reached {max_points} points. Exiting streaming mode.")
+            break
+
+        remaining = f" ({max_points - points_sent} remaining)" if max_points > 0 else ""
+        stream_input = input(f"Stream{remaining}> ")
+
+        if stream_input.lower() == 'q':
+            streaming = False
+        elif stream_input.lower() == 'test':
+            # 20-point sine wave on J1, safe amplitude
+            base_joints = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            t = 0
+            test_count = 20
+            # If max_points is set, cap the test to remaining points
+            if max_points > 0:
+                test_count = min(test_count, max_points - points_sent)
+            print(f"Running {test_count}-point sine wave test...")
+            for i in range(test_count):
+                joints = base_joints.copy()
+                joints[0] = 5.0 * math.sin(t)
+                dataPkg = pack_data(joints)
+                socket_send.send(dataPkg)
+                print(f"  Point {i+1}/{test_count}: J1={joints[0]:.2f}")
+                try:
+                    ack = socket_recv.recv(MAX_PACKET_SIZE)
+                    print(f"  ACK received")
+                except zmq.Again:
+                    print(f"  ACK timeout")
+                t += 0.3
+                points_sent += 1
+                time.sleep(0.5)
+            print("Streaming test completed.")
+        else:
+            try:
+                joints = [float(x.strip()) for x in stream_input.split(',')]
+                if len(joints) == 6:
+                    dataPkg = pack_data(joints)
+                    socket_send.send(dataPkg)
+                    print(f"Sent: {joints}")
+                    try:
+                        ack = socket_recv.recv(MAX_PACKET_SIZE)
+                        print("ACK received")
+                    except zmq.Again:
+                        print("ACK timeout")
+                    points_sent += 1
+                else:
+                    print(f"Need 6 values, got {len(joints)}")
+            except ValueError:
+                print("Invalid input. Use comma-separated numbers.")
+
+    print("--- Exited streaming mode ---")
+
 
 def main() -> None:
     global fmt_elen, PACKET_OFFSET, MAX_PACKET_SIZE
@@ -185,68 +266,36 @@ def main() -> None:
                     userInput_execution = input("Enter 'y' for state motion, 's' for streaming, 'n' to quit: ")
 
                     if userInput_execution.lower() == 'y':
-                        userPathSelection = input ("Input desired path for the robot to execute (1 or 2):  ")
+                        userPathSelection = input("Input desired path for the robot to execute (1A, 1B, 2A, 2B): ")
 
-                        stateExeList = LinedList()
+                        stateExeList = LinkedList()
                         if userPathSelection in object_group_1:
-                            for state in object_group_1[userPathSelection]:
-                                stateExeList.append(state)
-                                stateExeList.append("Home", "CB_Home", 1)
-                                stateExeList.append("Standby", "CB_Standby", 2)
-                                stateExeList.append("Home", "CB_Standby", 2)
-                                stateExeList.append("Home", "CB_Home", 3)
+                            # Example sequence: Home -> Standby -> Stream -> Home
+                            # "Stream" nodes trigger interactive_streaming_handler mid-execution
+                            stateExeList.append("Home", "CB_Home", 1)
+                            stateExeList.append("Standby", "CB_Standby", 2)
+                            stateExeList.append(STREAMING_STATE_NAME, "CB_Home", 2)  # MM enters streaming, CB holds Home
+                            stateExeList.append("Home", "CB_Home", 3)
+                        elif userPathSelection in object_group_2:
+                            # State-only sequence (no streaming)
+                            stateExeList.append("Home", "CB_Home", 1)
+                            stateExeList.append("Standby", "CB_Standby", 2)
+                            stateExeList.append("Home", "CB_Home", 3)
                         else:
                             print(f'wrong path selected')
 
-                        stateExeList.travers_and_execute(stateExeList.head, userPathSelection,
-                                                         socket_int_multiMove_send, socket_int_multiMove_recv,
-                                                         socket_int_cobot_send, socket_int_cobot_recv)
+                        stateExeList.traverse_and_execute(
+                            stateExeList.head, userPathSelection,
+                            socket_int_multiMove_send, socket_int_multiMove_recv,
+                            socket_int_cobot_send, socket_int_cobot_recv,
+                            streaming_handler=interactive_streaming_handler
+                        )
 
                     elif userInput_execution.lower() == 's':
-                        # PHASE 2: Joint streaming mode
-                        print("Streaming mode. Enter 6 comma-separated joint values (e.g., 0,0,0,0,0,0)")
-                        print("  'test' - Run 20-point sine wave test on J1 (+/- 5 deg)")
-                        print("  'q'    - Return to main menu")
-                        streaming = True
-                        while streaming:
-                            stream_input = input("Stream> ")
-                            if stream_input.lower() == 'q':
-                                streaming = False
-                            elif stream_input.lower() == 'test':
-                                # 20-point sine wave on J1, safe amplitude
-                                base_joints = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-                                t = 0
-                                print("Running 20-point sine wave test...")
-                                for i in range(20):
-                                    joints = base_joints.copy()
-                                    joints[0] = 5.0 * math.sin(t)
-                                    dataPkg = struct.pack("!I" + "d" * 6, 6, *joints)
-                                    socket_int_multiMove_send.send(dataPkg)
-                                    print(f"  Point {i+1}/20: J1={joints[0]:.2f}")
-                                    try:
-                                        ack = socket_int_multiMove_recv.recv(MAX_PACKET_SIZE)
-                                        print(f"  ACK received")
-                                    except zmq.Again:
-                                        print(f"  ACK timeout")
-                                    t += 0.3
-                                    time.sleep(0.5)
-                                print("Streaming test completed.")
-                            else:
-                                try:
-                                    joints = [float(x.strip()) for x in stream_input.split(',')]
-                                    if len(joints) == 6:
-                                        dataPkg = struct.pack("!I" + "d" * 6, 6, *joints)
-                                        socket_int_multiMove_send.send(dataPkg)
-                                        print(f"Sent: {joints}")
-                                        try:
-                                            ack = socket_int_multiMove_recv.recv(MAX_PACKET_SIZE)
-                                            print("ACK received")
-                                        except zmq.Again:
-                                            print("ACK timeout")
-                                    else:
-                                        print(f"Need 6 values, got {len(joints)}")
-                                except ValueError:
-                                    print("Invalid input. Use comma-separated numbers.")
+                        # PHASE 2: Standalone streaming mode (not linked to a state sequence)
+                        interactive_streaming_handler(
+                            socket_int_multiMove_send, socket_int_multiMove_recv
+                        )
 
                     else:
                         # send termination code to the connected servers before breaking the loop and terminating the program
