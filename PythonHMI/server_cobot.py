@@ -91,11 +91,11 @@ def main()->None:
         if not message is None:
             # Ensure the specific buffer size
             if len(message) >= struct.calcsize(fmt_elen):
-                elen = struct.unpack(fmt_elen, message)[0]
+                elen = struct.unpack_from(fmt_elen, message)[0]
                 fmt_data = "!" + "d" * elen
                 # Ensure the buffer is large enough to contain the expected data
-                if len(message) == struct.calcsize(fmt_elen) + PACKET_OFFSET:
-                    data = struct.unpack(fmt_data, message, PACKET_OFFSET)
+                if len(message) == struct.calcsize(fmt_data) + PACKET_OFFSET:
+                    data = struct.unpack_from(fmt_data, message, PACKET_OFFSET)
                     if data == (2, 2, 2): # Real Controller, RC
                         print("Connected to Real Controller.")
                         socket_ext_Cobot: ExtSocketServer = ExtSocketServer("192.168.0.100", 5024).create_socket()
@@ -136,11 +136,11 @@ def main()->None:
                 if not message is None:
                     # Ensure the specific buffer size
                     if len(message) >= struct.calcsize(fmt_elen):
-                        elen = struct.unpack(fmt_elen, message)[0]
+                        elen = struct.unpack_from(fmt_elen, message)[0]
                         fmt_data = "!" + "d" * elen
                         # Ensure the buffer is large enough to contain the expected data
-                        if len(message) == struct.calcsize(fmt_elen) + PACKET_OFFSET:
-                            data = struct.unpack(fmt_data, message, PACKET_OFFSET)
+                        if len(message) == struct.calcsize(fmt_data) + PACKET_OFFSET:
+                            data = struct.unpack_from(fmt_data, message, PACKET_OFFSET)
                             if data == (0, 0, 0): # termination command from client
                                 print("Termination command received from client.")
                                 break  # exit to cleanup below

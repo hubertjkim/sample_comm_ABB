@@ -1,16 +1,16 @@
 # PHASE 2: Enable Streaming Feature (Python + RAPID)
 
-**Status**: ⏳ First draft implemented (2026-02-09). Single-point joint streaming for ROB1 only. Circular buffer iteration pending.
+**Status**: ⏳ Single-point streaming VERIFIED (2026-02-17). Leaky bucket iteration next.
 **Goal**: Use the "Leaky Bucket" architecture for data streaming between Python and ABB RAPID code.
 **Restriction**: Current ABB RobotStudio can't use EGM (External Guided Motion, ~4ms streaming). Socket-based streaming only.
-**Next Step**: Verification in RobotStudio
+**Next Step**: Implement circular buffer (Leaky Bucket)
 
 ---
 
 ## Implementation History
 
-### Date: 2026-02-09 (First Draft)
-### Status: ⏳ AWAITING USER VERIFICATION
+### Date: 2026-02-09 (First Draft) — VERIFIED 2026-02-17
+### Status: ✅ Single-point streaming verified
 
 #### Implementation Summary
 First draft of joint streaming: establishes data structures, two-layer protocol dispatch, mode toggling, and single-point `MoveAbsJ` execution for ROB1 only. The full circular buffer ("Leaky Bucket") will be layered on top in a subsequent iteration.
@@ -117,18 +117,132 @@ Both `server_multiMove.py` and `server_cobot.py` now support graceful Ctrl+C shu
 
 ---
 
-## Testing Checklist
-- [ ] Load modified RAPID modules into robot controller
-- [ ] **Test 1 - Standard Regression**: clientUI → 'y' → path selection → verify existing state motion works
-- [ ] **Test 2 - Joint Stream (manual)**: clientUI → 's' → enter `0,0,0,0,0,0` → verify R1 moves to position
+## Testing Checklist (Single-Point)
+- [x] Load modified RAPID modules into robot controller
+- [x] **Test 1 - Standard Regression**: clientUI → 'y' → path selection → verify existing state motion works
+- [x] **Test 2 - Joint Stream (manual)**: clientUI → 's' → enter `0,0,0,0,0,0` → verify R1 moves to position
 - [ ] **Test 3 - Joint Stream (test)**: clientUI → 's' → type `test` → verify 20-point sine wave on J1
 - [ ] **Test 4 - Mode Switch**: Run state motion ('y'), then streaming ('s'), then state motion again
 - [ ] **Test 5 - Interrupt During Stream**: Trigger DI during joint stream motion, verify PHASE 1 works
 
+#### Verified Behavior (2026-02-17)
+- `pack_data` packs 6 joints with `elen=6` header; state motion packs 3 values with `elen=3`
+- server_multiMove.py dispatches by `elen`: `elen==6` → joint streaming, `elen==3` → state motion
+- `send_joint_stream()` blocks until RAPID ACK_DONE (`response[0]==9`), preventing next command until motion completes
+- `struct.unpack_from` (not `struct.unpack`) must be used in both server scripts — `struct.unpack` crashes on buffers larger than format size
+
+#### Bug Fix (2026-02-17)
+- `struct.unpack` → `struct.unpack_from` in server_multiMove.py (4 occurrences) and server_cobot.py (4 occurrences + 2 buffer size check fixes `fmt_elen` → `fmt_data`)
+
 ---
 
-## Next Iteration
-After validation, implement the circular buffer ("Leaky Bucket") for continuous streaming without per-point ACK wait.
+## Next Iteration: Circular Buffer ("Leaky Bucket")
+
+### Problem with Current Single-Point Architecture
+Each point follows: send → RAPID moves → ACK_DONE → send next. The robot must **stop completely** between points because the next target hasn't arrived yet. This creates jerky stop-start motion.
+
+### Target Architecture
+
+```
+clientUI → [ZMQ] → server_multiMove → [TCP/IP] → commModule ──writes──→ streamBuffer{N}
+                                                                              ↑ reads ↑
+                                                                         MainModule_ROB1
+                                                                     (MoveAbsJ with zone blending)
+```
+
+**Key change**: commModule (producer) writes points into a circular buffer as fast as Python sends them. MainModule_ROB1 (consumer) reads from the buffer and executes `MoveAbsJ` with **zone blending** (`z5`) so the robot flows smoothly between points without stopping.
+
+### Files To Modify
+
+#### 1. commModule.mod — Producer
+
+**New PERS variables** (replace single `streamJointTarget_R1` + `newStreamTarget_R1`):
+```rapid
+CONST num BUF_SIZE := 10;
+PERS jointtarget streamBuffer{10};     ! circular buffer
+PERS num write_ptr := 1;              ! commModule increments
+PERS num read_ptr := 1;               ! MainModule_R1 increments
+PERS bool is_streaming := FALSE;       ! master mode switch
+```
+
+**updateGlobalVariable "j" case** — change from:
+- Write to single `streamJointTarget_R1`, set `newStreamTarget_R1 := TRUE`
+
+To:
+- Write to `streamBuffer{write_ptr}`, advance `write_ptr` (wrap at BUF_SIZE)
+- Set `is_streaming := TRUE` on first write
+- Buffer full check: if next write_ptr would equal read_ptr, buffer is full — drop or overwrite oldest
+
+**cmdExe "j" case** — change from:
+- Set `executionNotCompleted_R1 := TRUE`, wait for it to clear, then send ACK_DONE
+
+To:
+- ACK immediately after buffer write (don't wait for motion completion). This decouples communication speed from motion speed.
+
+#### 2. MainModule_ROB1.mod — Consumer
+
+**KeepLooping** — change from:
+```rapid
+IF newStreamTarget_R1 = TRUE THEN
+    newStreamTarget_R1 := FALSE;
+    Run_Joint_Stream_R1;
+    executionNotCompleted_R1 := FALSE;
+ENDIF
+```
+
+To:
+- Check `is_streaming` flag
+- Calculate buffer level: `points_available := (write_ptr - read_ptr + BUF_SIZE) MOD BUF_SIZE`
+- **Anti-starvation**: don't start moving until buffer has >= 3 points (tunable)
+- Execute `MoveAbsJ streamBuffer{read_ptr}, v1000, z5, tool0` — the `z5` zone enables lookahead blending so the robot doesn't stop between points
+- Advance `read_ptr` (wrap at BUF_SIZE)
+- If buffer empty, `WaitTime 0.005` to avoid CPU spin
+
+**Run_Joint_Stream_R1** — replace single MoveAbsJ with a consumer loop that keeps pulling from the buffer while `is_streaming = TRUE` and points are available.
+
+**PHASE 1 compatibility**: The existing `trap_handle_stop_R1` still works — StopMove/ClearPath/ExitCycle aborts the consumer loop. On restart, reset `is_streaming := FALSE` and reset pointers.
+
+#### 3. MainModule_ROB2.mod — PERS Declarations
+
+Add matching PERS declarations for all new cross-task variables (`streamBuffer`, `write_ptr`, `read_ptr`, `is_streaming`). R2 doesn't use them yet but PERS requires matching declarations in all tasks.
+
+#### 4. server_multiMove.py — Feed Rate
+
+**send_joint_stream** — change from:
+- Send `j;values`, block in `while not done` loop waiting for `response[0] == 9` (motion-complete ACK)
+
+To:
+- Send `j;values`, wait for lightweight ACK (buffer-accepted) instead of motion-complete ACK
+- This allows Python to keep feeding points without waiting for each motion to finish
+
+#### 5. clientUI.py — Rate Limiting
+
+**interactive_streaming_handler `test` mode** — add rate control:
+- Send points at a fixed rate (e.g., 30 Hz) using `time.sleep(1/30)`
+- Don't block on per-point motion-complete ACK in streaming mode
+
+### Tuning Parameters
+
+| Parameter | Location | Initial Value | Effect |
+|-----------|----------|---------------|--------|
+| `BUF_SIZE` | commModule | 10 | Larger = more latency, less stutter |
+| Anti-starvation threshold | MainModule_R1 | 3 | Min points before motion starts |
+| Zone size | MainModule_R1 | `z5` | Larger = smoother but less precise |
+| Send rate | clientUI | 30 Hz | Must match or exceed motion consumption rate |
+
+### Open Design Decisions
+1. **Buffer full policy**: When Python sends faster than RAPID consumes — drop newest point, or overwrite oldest?
+2. **Stop streaming signal**: How does Python tell RAPID to exit streaming mode? Special header like `"s;"` (stop stream), or switch back to `"d;"` mode?
+3. **Buffer level feedback**: Should RAPID send buffer level back to Python so Python can adjust send rate? Or keep it simple with just ACK/NACK?
+4. **R2 streaming**: Extend to R2 in this iteration, or keep R1-only?
+
+### Testing Checklist (Leaky Bucket)
+- [ ] **Test 1 - Buffer Fill**: Send 5+ points rapidly, verify robot doesn't move until anti-starvation threshold is met
+- [ ] **Test 2 - Smooth Motion**: Send continuous sine wave, verify blended motion (no stop between points)
+- [ ] **Test 3 - Buffer Drain**: Stop sending, verify robot finishes remaining buffered points gracefully
+- [ ] **Test 4 - Buffer Overflow**: Send faster than robot can consume, verify buffer full policy works
+- [ ] **Test 5 - Mode Switch**: Enter streaming, exit, return to state motion
+- [ ] **Test 6 - Interrupt During Stream**: Trigger DI, verify PHASE 1 ExitCycle + pointer reset
 
 ---
 

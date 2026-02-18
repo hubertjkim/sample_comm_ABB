@@ -3,11 +3,12 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 **Always check `ACTIVE_PHASE` in CLAUDE.md before making changes.**
 **Always update the relevant PHASE markdown file before making changes.**
+**Always ask permission to modify any script**
 
 
-**CURRENT STATUS**: PHASE 2 first draft implemented (2026-02-09). Single-point joint streaming for ROB1.
+**CURRENT STATUS**: PHASE 2 single-point streaming verified (2026-02-17). Leaky bucket iteration next.
 **PHASE 1 STATUS**: VALIDATED (2026-02-10). ExitCycle approach works. SyncMoveOn replaced with WaitSyncTask + independent moves.
-**NEXT STEP**: PHASE 2 verification in RobotStudio
+**NEXT STEP**: Implement circular buffer (Leaky Bucket) for continuous streaming
 
 ## Project Overview
 
@@ -41,7 +42,7 @@ This is a Handshake Platform between Python and ABB RobotStudio involving **THRE
 ### PHASE 2 (ACTIVE_PHASE): Enable Streaming feature (Python + RAPID)
 - **Details**: [PHASE_2.md](PHASE_2.md)
 - **Goal**: Use the "Leaky Bucket" architecture for data streaming between Python and ABB RAPID code.
-- **Status**: ⏳ First draft implemented (2026-02-09) - Single-point joint streaming for ROB1 only. Circular buffer iteration pending.
+- **Status**: ⏳ Single-point verified (2026-02-17). Circular buffer (Leaky Bucket) plan outlined, implementation next.
 
 ### PHASE 3 (Future_PHASE): Enable ROS2 via Docker/WSL2
 - **Details**: [PHASE_3.md](PHASE_3.md)
